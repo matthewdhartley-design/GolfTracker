@@ -191,11 +191,12 @@ def get_courses_with_hole_score_data() -> list[str]:
 
 def get_hole_scores_with_par(course_name: str) -> pd.DataFrame:
     """For a given course, return every recorded hole_number/score/par row
-    across all rounds with hole-level detail, using each round's own tee to
-    look up the correct par per hole.
+    (plus which tee that round was played on) across all rounds with
+    hole-level detail, using each round's own tee to look up the correct par
+    per hole.
     """
     query = text("""
-        SELECT d.hole_number, d.score, hi.par
+        SELECT d.hole_number, d.score, hi.par, r.tee_color_played
         FROM golf.golf_hole_details d
         JOIN golf.golf_rounds r ON d.round_id = r.round_id
         JOIN golf.golf_hole_info hi
@@ -207,18 +208,39 @@ def get_hole_scores_with_par(course_name: str) -> pd.DataFrame:
         return pd.read_sql(query, conn, params={"course_name": course_name})
 
 
+def get_all_hole_scores_with_par() -> pd.DataFrame:
+    """Return every recorded hole_number/score/par/yardage/stroke_index row,
+    across every round that has both hole-level scores (golf_hole_details)
+    and matching hole-level info (golf_hole_info) for the course/tee it was
+    played on, tagged with round_id/date/course_name/tee_color_played/
+    total_score so callers can group by round.
+    """
+    query = """
+        SELECT r.round_id, r.date, r.course_name, r.tee_color_played, r.total_score,
+               d.hole_number, d.score, hi.par, hi.yardage, hi.stroke_index
+        FROM golf.golf_hole_details d
+        JOIN golf.golf_rounds r ON d.round_id = r.round_id
+        JOIN golf.golf_hole_info hi
+          ON hi.course_name = r.course_name AND hi.tee_color = r.tee_color_played
+         AND hi.hole_number = d.hole_number
+        ORDER BY r.date, d.hole_number
+    """
+    with get_db_connection() as conn:
+        return pd.read_sql(query, conn)
+
+
 def get_macro_rounds() -> pd.DataFrame:
-    """Fetch all golf.golf_rounds joined with their course/tee rating and
-    slope, sorted chronologically by date.
+    """Fetch all golf.golf_rounds joined with their course/tee rating,
+    slope, and par, sorted chronologically by date.
 
     Uses a LEFT JOIN so rounds without a matching golf_course_tees row still
-    appear (with null course_rating/slope_rating) rather than disappearing
-    from totals and best-score stats.
+    appear (with null course_rating/slope_rating/course_par) rather than
+    disappearing from totals and best-score stats.
     """
     query = """
         SELECT r.round_id, r.date, r.course_name, r.tee_color_played,
                r.total_score, r.handicap_after_round,
-               t.course_rating, t.slope_rating
+               t.course_rating, t.slope_rating, t.par AS course_par
         FROM golf.golf_rounds r
         LEFT JOIN golf.golf_course_tees t
           ON r.course_name = t.course_name AND r.tee_color_played = t.tee_color

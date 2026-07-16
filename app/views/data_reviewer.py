@@ -9,6 +9,14 @@ from database.queries import (
 )
 
 
+_COMPLETENESS_OPTIONS = {
+    "All": None,
+    "Complete (18/18)": lambda s: s >= 18,
+    "Incomplete (1-17)": lambda s: (s > 0) & (s < 18),
+    "None (0/18)": lambda s: s == 0,
+}
+
+
 def _render_rounds_overview():
     rounds_df = get_rounds_with_hole_counts()
 
@@ -25,7 +33,35 @@ def _render_rounds_overview():
     col2.metric("Rounds With Any Hole Detail", with_any_holes)
     col3.metric("Rounds With Full 18 Holes", with_full_18)
 
-    table_df = rounds_df.sort_values("date", ascending=False).copy()
+    course_options = sorted(rounds_df["course_name"].dropna().unique().tolist())
+    tee_options = sorted(rounds_df["tee_color_played"].dropna().unique().tolist())
+
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    with filter_col1:
+        selected_courses = st.multiselect(
+            "Course", course_options, default=course_options, key="data_reviewer_course_filter"
+        )
+    with filter_col2:
+        selected_tees = st.multiselect(
+            "Tee", tee_options, default=tee_options, key="data_reviewer_tee_filter"
+        )
+    with filter_col3:
+        selected_completeness = st.selectbox(
+            "Hole Scores Recorded", list(_COMPLETENESS_OPTIONS.keys()), key="data_reviewer_completeness_filter"
+        )
+
+    filtered_df = rounds_df[
+        rounds_df["course_name"].isin(selected_courses) & rounds_df["tee_color_played"].isin(selected_tees)
+    ]
+    completeness_predicate = _COMPLETENESS_OPTIONS[selected_completeness]
+    if completeness_predicate is not None:
+        filtered_df = filtered_df[completeness_predicate(filtered_df["hole_scores_recorded"])]
+
+    if filtered_df.empty:
+        st.info("No rounds match the selected filters.")
+        return
+
+    table_df = filtered_df.sort_values("date", ascending=False).copy()
     table_df["date"] = pd.to_datetime(table_df["date"]).dt.strftime("%d-%b-%y")
     table_df["hole_scores_recorded"] = table_df["hole_scores_recorded"].astype(str) + " / 18"
     table_df = table_df.rename(columns={

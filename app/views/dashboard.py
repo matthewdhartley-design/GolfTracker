@@ -3,7 +3,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from app.calculations.whs import compute_handicap_trend
-from database.queries import get_macro_rounds
+from database.queries import get_all_hole_scores_with_par, get_macro_rounds
 
 _X_AXIS_OPTIONS = {"Date": "date", "Round ID": "round_id"}
 
@@ -135,8 +135,20 @@ def render_dashboard():
         st.warning("No rounds match the selected filters.")
         return
 
-    rated_df = rounds_df.dropna(subset=["course_rating", "slope_rating"]).sort_values("date")
-    rated_df = compute_handicap_trend(rated_df) if not rated_df.empty else rated_df
+    # course_rating/slope_rating of exactly 0 is this project's placeholder sentinel for
+    # "not yet rated" (e.g. a brand-new tee with no real course rating supplied yet) --
+    # treat it the same as missing/null, since 113/0 in the WHS differential formula
+    # produces inf and corrupts the rolling handicap average for every round that follows
+    # it into the 20-round window.
+    rated_df = rounds_df[
+        rounds_df["course_rating"].notna() & (rounds_df["course_rating"] != 0)
+        & rounds_df["slope_rating"].notna() & (rounds_df["slope_rating"] != 0)
+    ].sort_values("date")
+
+    if not rated_df.empty:
+        hole_df = get_all_hole_scores_with_par()
+        hole_df = hole_df[hole_df["round_id"].isin(rated_df["round_id"])]
+        rated_df, capped_holes_df = compute_handicap_trend(rated_df, hole_df)
 
     total_rounds = len(rounds_df)
     best_score = rounds_df["total_score"].min()

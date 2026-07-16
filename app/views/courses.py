@@ -1,8 +1,14 @@
+import re
+
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
+from app.calculations.handicap_data import get_full_handicap_history
 from app.calculations.scoring import CATEGORY_ORDER, hole_score_distribution
-from database.queries import get_courses_with_hole_score_data, get_hole_scores_with_par
+from app.calculations.streaks import best_streak, best_streaks_by_round, max_consecutive_holes
+from database.queries import get_courses_with_hole_score_data, get_hole_info
 
 _CATEGORY_COLORS = {
     "Birdie or Better": "#0ca30c",
@@ -11,28 +17,167 @@ _CATEGORY_COLORS = {
     "Double Bogey": "#eb6834",
     "Triple+ Bogey": "#d03b3b",
 }
+_CATEGORY_TABLE_LABELS = {
+    "Birdie or Better": "Birdies",
+    "Par": "Pars",
+    "Bogey": "Bogeys",
+    "Double Bogey": "Doubles",
+    "Triple+ Bogey": "Triple+",
+}
+_DEFAULT_COURSE = "CCC"
 
 
-def render_course_analyzer():
-    """Render the Course Analyzer tab: a stacked bar chart showing, for a
-    single selected course, how every recorded round's score broke down
-    (birdie or better / par / bogey / double / triple+) on each hole.
+def _use_capped_scores(holes_df: pd.DataFrame) -> pd.DataFrame:
+    """Swap in the net-double-bogey-capped score as 'score' (keeping the
+    original real score as 'raw_score') so downstream categorization/avg
+    calculations use capped values without needing to know about capping.
     """
+    return holes_df.rename(columns={"score": "raw_score", "capped_score": "score"})
+
+
+def _distinct_or_joined(values) -> str:
+    """Collapse a hole's per-tee values (e.g. par, stroke index) into a single
+    display string -- the plain value if every tee agrees, or all distinct
+    values joined with '/' if they don't (this genuinely happens: CCC's
+    stroke index differs between tees on holes 12 and 14).
+    """
+    distinct = sorted(set(values))
+    return str(distinct[0]) if len(distinct) == 1 else " / ".join(str(v) for v in distinct)
+
+
+def _count_with_pct(counts: pd.DataFrame, key, category: str, total: int) -> str:
+    count = int(counts.loc[key, category]) if key in counts.index else 0
+    pct = round(100 * count / total) if total else 0
+    return f"{count} ({pct}%)"
+
+
+def _sort_key(value) -> str:
+    """Extract a sortable value from a table cell: numbers sort numerically,
+    'N (P%)' cells sort by the count N, everything else sorts as text.
+    """
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return text
+    match = re.match(r"^(-?\d+(\.\d+)?)\s*\(", text)
+    if match:
+        return match.group(1)
+    return text.lower()
+
+
+def _render_table_with_fixed_total(rows: list[dict], total_row: dict, table_id: str):
+    """Render `rows` as a click-to-sort table with `total_row` permanently
+    pinned as the last row, no header of its own, and no gap from the row
+    above it.
+
+    st.dataframe can't pin a row (sorting could move a Total row out of
+    place) or hide its header, and two separate st.dataframe widgets can't
+    be guaranteed to line up column-for-column since each auto-sizes
+    independently. This renders one HTML table with real click-to-sort via
+    embedded JS instead -- st.markdown doesn't reliably execute <script>
+    tags, so this uses st.components.v1.html, which runs in a real iframe.
+    The Total row lives in its own <tbody> that the sort script never
+    touches, so it always stays last regardless of how the data is sorted.
+    """
+    columns = list(rows[0].keys())
+
+    def _cells(row: dict, *, bold: bool = False) -> str:
+        style = "font-weight:600;" if bold else ""
+        return "".join(
+            f"<td data-value=\"{_sort_key(row[col])}\" style='padding:4px 8px;{style}"
+            f"{'' if col == 'Hole' else 'text-align:right;'}'>{row[col]}</td>"
+            for col in columns
+        )
+
+    header_cells = "".join(
+        f"<th style='text-align:{'left' if col == 'Hole' else 'right'};padding:4px 8px;"
+        f"cursor:pointer;user-select:none;' onclick=\"sortTable_{table_id}({i})\">{col}</th>"
+        for i, col in enumerate(columns)
+    )
+    data_rows = "".join(f"<tr>{_cells(row)}</tr>" for row in rows)
+    total_row_html = f"<tr>{_cells(total_row, bold=True)}</tr>"
+
+    row_height = 35
+    height = (len(rows) + 2) * row_height + 20
+
+    html = f"""
+    <div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;color:#0b0b0b;">
+    <table style='width:100%;border-collapse:collapse;font-size:0.9rem;'>
+        <thead id="header-{table_id}"><tr>{header_cells}</tr></thead>
+        <tbody id="data-body-{table_id}">{data_rows}</tbody>
+        <tbody>{total_row_html}</tbody>
+    </table>
+    </div>
+    <script>
+    function sortTable_{table_id}(colIndex) {{
+        const tbody = document.getElementById('data-body-{table_id}');
+        const ths = document.getElementById('header-{table_id}').querySelectorAll('th');
+        const ascending = !(tbody.getAttribute('data-sort-col') == colIndex
+                             && tbody.getAttribute('data-sort-dir') === 'asc');
+
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.sort((a, b) => {{
+            const x = a.children[colIndex].getAttribute('data-value');
+            const y = b.children[colIndex].getAttribute('data-value');
+            const nx = parseFloat(x), ny = parseFloat(y);
+            const result = (!isNaN(nx) && !isNaN(ny)) ? (nx - ny) : x.localeCompare(y);
+            return ascending ? result : -result;
+        }});
+        rows.forEach(r => tbody.appendChild(r));
+        tbody.setAttribute('data-sort-col', colIndex);
+        tbody.setAttribute('data-sort-dir', ascending ? 'asc' : 'desc');
+
+        ths.forEach((th, i) => {{
+            th.innerText = th.innerText.replace(/ [\\u25b2\\u25bc]$/, '');
+            if (i === colIndex) {{ th.innerText += ascending ? ' \\u25b2' : ' \\u25bc'; }}
+        }});
+    }}
+    </script>
+    """
+    components.html(html, height=height)
+
+
+def _no_data_message():
+    st.info(
+        "No rounds yet have both hole-by-hole scores and course hole-by-hole "
+        "par data recorded, so there's nothing to analyze."
+    )
+
+
+def _render_by_hole(capped_holes_df: pd.DataFrame):
     courses = get_courses_with_hole_score_data()
 
     if not courses:
-        st.info(
-            "No rounds yet have both hole-by-hole scores and course hole-by-hole "
-            "par data recorded, so there's nothing to analyze."
-        )
+        _no_data_message()
         return
 
-    selected_course = st.selectbox("Course", courses)
+    default_index = courses.index(_DEFAULT_COURSE) if _DEFAULT_COURSE in courses else 0
+    selected_course = st.selectbox("Course", courses, index=default_index)
 
-    scores_df = get_hole_scores_with_par(selected_course)
+    scores_df = capped_holes_df[capped_holes_df["course_name"] == selected_course].copy()
     if scores_df.empty:
         st.info(f"No hole-level scoring data available for {selected_course}.")
         return
+
+    available_tees = sorted(scores_df["tee_color_played"].unique().tolist())
+    selected_tees = st.multiselect("Tee", available_tees, default=available_tees)
+    scores_df = scores_df[scores_df["tee_color_played"].isin(selected_tees)]
+    if scores_df.empty:
+        st.info("No hole-level scoring data available for the selected tee(s).")
+        return
+
+    scores_df = _use_capped_scores(scores_df)
+    scores_df["to_par"] = scores_df["score"] - scores_df["par"]
+    st.caption(
+        "Scores below are net-double-bogey capped for handicap purposes (WHS Rule 3.1) -- "
+        "your original recorded scores are unchanged in the database."
+    )
+
+    hole_info = get_hole_info()
+    hole_info = hole_info[
+        (hole_info["course_name"] == selected_course) & (hole_info["tee_color"].isin(selected_tees))
+    ]
 
     counts = hole_score_distribution(scores_df)
 
@@ -54,3 +199,178 @@ def render_course_analyzer():
         margin=dict(b=100),
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Hole-by-Hole Performance")
+
+    par_by_hole = hole_info.groupby("hole_number")["par"].apply(_distinct_or_joined)
+    stroke_index_by_hole = hole_info.groupby("hole_number")["stroke_index"].apply(_distinct_or_joined)
+    avg_to_par_by_hole = scores_df.groupby("hole_number")["to_par"].mean()
+    row_totals = counts.sum(axis=1)
+
+    rows = []
+    for hole in range(1, 19):
+        total = int(row_totals.get(hole, 0))
+        row = {
+            "Hole": str(hole),
+            "Par": par_by_hole.get(hole, ""),
+            "Stroke Index": stroke_index_by_hole.get(hole, ""),
+            "Avg Score to Par": round(avg_to_par_by_hole[hole], 2) if hole in avg_to_par_by_hole.index else None,
+        }
+        for category in CATEGORY_ORDER:
+            row[_CATEGORY_TABLE_LABELS[category]] = _count_with_pct(counts, hole, category, total)
+        rows.append(row)
+
+    grand_total = int(row_totals.sum())
+    total_par = hole_info.groupby("hole_number")["par"].first()
+    total_row = {
+        "Hole": "Total",
+        "Par": str(int(total_par.sum())) if not total_par.empty else "",
+        "Stroke Index": "",
+        "Avg Score to Par": round(scores_df["to_par"].mean(), 2),
+    }
+    for category in CATEGORY_ORDER:
+        count = int(counts[category].sum())
+        pct = round(100 * count / grand_total) if grand_total else 0
+        total_row[_CATEGORY_TABLE_LABELS[category]] = f"{count} ({pct}%)"
+
+    _render_table_with_fixed_total(rows, total_row, table_id="by_hole")
+
+    st.subheader("Score Summary by Par Type")
+
+    par_lookup = hole_info.groupby("hole_number")["par"].first()
+    scores_df["hole_par_type"] = scores_df["hole_number"].map(par_lookup)
+    par_counts = hole_score_distribution_by_group(scores_df, "hole_par_type")
+    par_row_totals = par_counts.sum(axis=1)
+
+    par_rows = []
+    for par_type in sorted(par_counts.index):
+        total = int(par_row_totals.get(par_type, 0))
+        subset = scores_df[scores_df["hole_par_type"] == par_type]
+        row = {
+            "Hole": f"Par {int(par_type)}",
+            "Par": str(int(par_type)),
+            "Stroke Index": "",
+            "Avg Score to Par": round(subset["to_par"].mean(), 2),
+        }
+        for category in CATEGORY_ORDER:
+            row[_CATEGORY_TABLE_LABELS[category]] = _count_with_pct(par_counts, par_type, category, total)
+        par_rows.append(row)
+
+    par_grand_total = int(par_row_totals.sum())
+    par_total_row = {
+        "Hole": "Total",
+        "Par": "",
+        "Stroke Index": "",
+        "Avg Score to Par": round(scores_df["to_par"].mean(), 2),
+    }
+    for category in CATEGORY_ORDER:
+        count = int(par_counts[category].sum())
+        pct = round(100 * count / par_grand_total) if par_grand_total else 0
+        par_total_row[_CATEGORY_TABLE_LABELS[category]] = f"{count} ({pct}%)"
+
+    _render_table_with_fixed_total(par_rows, par_total_row, table_id="par_type")
+
+
+def hole_score_distribution_by_group(scores_df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Like hole_score_distribution, but grouped by an arbitrary column
+    (e.g. par type) instead of hole_number, with no fixed 1-18 row range.
+    """
+    from app.calculations.scoring import categorize_score
+
+    df = scores_df.copy()
+    df["category"] = [categorize_score(s, p) for s, p in zip(df["score"], df["par"])]
+    counts = df.groupby([group_col, "category"]).size().unstack(fill_value=0)
+    counts = counts.reindex(columns=CATEGORY_ORDER, fill_value=0)
+    return counts
+
+
+def _render_streaks(capped_holes_df: pd.DataFrame):
+    if capped_holes_df.empty:
+        _no_data_message()
+        return
+
+    all_holes = _use_capped_scores(capped_holes_df)
+    st.caption(
+        "Streaks are computed on net-double-bogey-capped scores (WHS Rule 3.1) -- "
+        "your original recorded scores are unchanged in the database."
+    )
+
+    round_meta = (
+        all_holes[["round_id", "date", "course_name", "tee_color_played", "total_score"]]
+        .drop_duplicates()
+        .sort_values("date", ascending=False)
+    )
+    round_meta["label"] = (
+        pd.to_datetime(round_meta["date"]).dt.strftime("%d-%b-%y") + " -- "
+        + round_meta["course_name"] + " (" + round_meta["tee_color_played"] + ") -- "
+        + round_meta["total_score"].astype(str)
+    )
+
+    selected_label = st.selectbox("Round", round_meta["label"].tolist())
+    selected_round_id = round_meta.loc[round_meta["label"] == selected_label, "round_id"].iloc[0]
+
+    length = st.slider("Streak length (holes)", min_value=1, max_value=18, value=6)
+
+    selected_round_holes = all_holes[all_holes["round_id"] == selected_round_id]
+    selected_result = best_streak(selected_round_holes, length)
+
+    if selected_result is None:
+        longest = max_consecutive_holes(selected_round_holes)
+        st.warning(
+            f"This round doesn't have {length} consecutive holes recorded -- "
+            f"the longest consecutive run available is {longest} holes."
+        )
+    else:
+        sign = "+" if selected_result["to_par"] > 0 else ""
+        st.metric(
+            f"Best {length}-Hole Streak",
+            f"{sign}{selected_result['to_par']} to par",
+            help=f"Holes {selected_result['start_hole']}-{selected_result['end_hole']}",
+        )
+        st.caption(f"Holes {selected_result['start_hole']} to {selected_result['end_hole']}")
+
+    all_best = best_streaks_by_round(all_holes, length)
+    if not all_best:
+        st.info(f"No round has {length} consecutive holes recorded yet.")
+        return
+
+    to_par_values = pd.Series([v["to_par"] for v in all_best.values()])
+    value_counts = to_par_values.value_counts().sort_index()
+    full_range = range(int(value_counts.index.min()), int(value_counts.index.max()) + 1)
+    value_counts = value_counts.reindex(full_range, fill_value=0)
+
+    bar_colors = [
+        "#0ca30c" if (selected_result is not None and x == selected_result["to_par"]) else "#2a78d6"
+        for x in value_counts.index
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=[str(x) for x in value_counts.index],
+        y=value_counts.values,
+        marker_color=bar_colors,
+    ))
+    fig.update_layout(
+        title=f"Best {length}-Hole Streak Distribution -- All Rounds ({len(all_best)} rounds)",
+        xaxis_title="Best Streak (Strokes to Par)",
+        yaxis_title="Number of Rounds",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    if selected_result is not None:
+        st.caption(
+            f"This round's best {length}-hole streak ({selected_result['to_par']:+d}) "
+            "is highlighted in green above."
+        )
+
+
+def render_course_analyzer():
+    """Render the Course Analyzer tab."""
+    _, capped_holes_df = get_full_handicap_history()
+
+    tab_by_hole, tab_streaks = st.tabs(["By Hole", "Streaks"])
+
+    with tab_by_hole:
+        _render_by_hole(capped_holes_df)
+
+    with tab_streaks:
+        _render_streaks(capped_holes_df)

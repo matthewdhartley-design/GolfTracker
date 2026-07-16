@@ -1,5 +1,7 @@
 import pandas as pd
 
+from app.calculations.net_double_bogey import capped_hole_score, course_handicap
+
 # WHS Rule 5.1 selection table: number of recent scores available ->
 # (number of best differentials to average, adjustment applied to that average).
 _SELECTION_TABLE = {
@@ -96,10 +98,37 @@ def counts_toward_current_high_handicap(df: pd.DataFrame) -> pd.Series:
     return mask
 
 
-def compute_handicap_trend(rounds_df: pd.DataFrame) -> pd.DataFrame:
-    """Add handicap trend columns to a chronologically-sorted rounds
-    DataFrame that has total_score, course_rating, and slope_rating columns:
+def _is_placeholder(value) -> bool:
+    """True if a rating-type value is missing or this project's '0' placeholder
+    sentinel for "not yet supplied" (see golf_schema memory notes)."""
+    return pd.isna(value) or value == 0
 
+
+def compute_handicap_trend(
+    rounds_df: pd.DataFrame, hole_df: pd.DataFrame | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Add handicap trend columns to a chronologically-sorted rounds
+    DataFrame that has round_id, total_score, course_rating, slope_rating,
+    and course_par columns, and return (rounds_result, capped_holes).
+
+    Every round's score used for the differential is net-double-bogey capped
+    when possible (adjusted gross score, per WHS): each hole is capped at
+    par + 2 + the strokes that round's Course Handicap grants on that hole,
+    where Course Handicap is derived from the WHS Handicap Index as it stood
+    immediately *before* that round (a genuinely sequential, rolling
+    computation -- capping round N affects the index used to cap round N+1).
+    Capping requires `hole_df` to have a matching round_id/hole_number group
+    with par/stroke_index, a real (non-placeholder) course_par/course_rating/
+    slope_rating, and a prior Handicap Index to already exist (impossible for
+    the very first rated round). Whenever any of that is unavailable, the
+    round's raw total_score is used unchanged -- this is a deliberate
+    fallback, not an error.
+
+    rounds_result columns (one row per round):
+    - effective_score: the score actually used for this round's differential
+      (net-double-bogey capped where possible, else raw total_score).
+    - course_handicap_used: the Course Handicap applied for capping, or None
+      if this round's score wasn't capped.
     - score_differential: the WHS score differential for that round.
     - whs_handicap_index / counting_low / counting_high: the WHS Rule 5.1
       handicap index after that round, and the min/max of the differentials
@@ -110,20 +139,63 @@ def compute_handicap_trend(rounds_df: pd.DataFrame) -> pd.DataFrame:
       "High Handicap" (worst-8) mirror of the above, after that round.
     - counts_toward_high_handicap: marks which rows feed into the latest
       (most recent) high_handicap_index.
+
+    capped_holes columns: every column from hole_df for rounds with hole
+    data, plus 'capped_score' (equal to 'score' wherever capping wasn't
+    possible for that round).
     """
-    df = rounds_df.copy()
-    df["score_differential"] = score_differential(
-        df["total_score"], df["course_rating"], df["slope_rating"]
+    df = rounds_df.sort_values("date").reset_index(drop=True).copy()
+
+    holes_by_round = (
+        {round_id: group for round_id, group in hole_df.groupby("round_id")}
+        if hole_df is not None and not hole_df.empty
+        else {}
     )
 
     running: list[float] = []
+    effective_scores = []
+    course_handicaps_used = []
     index_after_round = []
     counting_low = []
     counting_high = []
     high_index_after_round = []
     high_counting_low = []
     high_counting_high = []
-    for diff in df["score_differential"]:
+    capped_hole_groups = []
+
+    for row in df.itertuples():
+        prior_index = handicap_index(running)
+
+        hole_group = holes_by_round.get(row.round_id)
+        can_cap = (
+            hole_group is not None
+            and prior_index is not None
+            and not _is_placeholder(row.course_par)
+            and not _is_placeholder(row.course_rating)
+            and not _is_placeholder(row.slope_rating)
+        )
+
+        if can_cap:
+            ch = course_handicap(prior_index, row.slope_rating, row.course_rating, row.course_par)
+            hole_group = hole_group.copy()
+            hole_group["capped_score"] = [
+                capped_hole_score(score, par, si, ch)
+                for score, par, si in zip(hole_group["score"], hole_group["par"], hole_group["stroke_index"])
+            ]
+            effective_score = hole_group["capped_score"].sum()
+            capped_hole_groups.append(hole_group)
+        else:
+            ch = None
+            effective_score = row.total_score
+            if hole_group is not None:
+                hole_group = hole_group.copy()
+                hole_group["capped_score"] = hole_group["score"]
+                capped_hole_groups.append(hole_group)
+
+        effective_scores.append(effective_score)
+        course_handicaps_used.append(ch)
+
+        diff = score_differential(effective_score, row.course_rating, row.slope_rating)
         running.append(diff)
 
         index_after_round.append(handicap_index(running))
@@ -136,6 +208,9 @@ def compute_handicap_trend(rounds_df: pd.DataFrame) -> pd.DataFrame:
         high_counting_low.append(min(worst))
         high_counting_high.append(max(worst))
 
+    df["effective_score"] = effective_scores
+    df["course_handicap_used"] = course_handicaps_used
+    df["score_differential"] = running
     df["whs_handicap_index"] = index_after_round
     df["counting_low"] = counting_low
     df["counting_high"] = counting_high
@@ -146,4 +221,10 @@ def compute_handicap_trend(rounds_df: pd.DataFrame) -> pd.DataFrame:
     df["high_counting_high"] = high_counting_high
     df["counts_toward_high_handicap"] = counts_toward_current_high_handicap(df)
 
-    return df
+    capped_holes = (
+        pd.concat(capped_hole_groups, ignore_index=True)
+        if capped_hole_groups
+        else pd.DataFrame(columns=(hole_df.columns.tolist() if hole_df is not None else []) + ["capped_score"])
+    )
+
+    return df, capped_holes
