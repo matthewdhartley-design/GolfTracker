@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 
+from app.views.all_time_records import render_all_time_records
 from app.views.courses import render_course_analyzer
 from app.views.dashboard import render_dashboard
 from app.views.data_reviewer import render_data_reviewer
@@ -18,9 +19,13 @@ st.set_page_config(page_title="Golf Analytics", layout="wide")
 
 st.title("Golf Analytics")
 
-tab_macro, tab_courses, tab_scorecard, tab_data_reviewer, tab_yardage, tab_stroke_index = st.tabs(
-    ["Macro Trends", "Course Analyzer", "Scorecard AI", "Data Reviewer", "Yardage Analysis", "Stroke Index Analysis"]
-)
+(
+    tab_macro, tab_courses, tab_scorecard, tab_data_reviewer,
+    tab_yardage, tab_stroke_index, tab_all_time,
+) = st.tabs([
+    "Macro Trends", "Course Analyzer", "Scorecard AI", "Data Reviewer",
+    "Yardage Analysis", "Stroke Index Analysis", "All Time Records",
+])
 
 with tab_macro:
     render_dashboard()
@@ -39,3 +44,6 @@ with tab_yardage:
 
 with tab_stroke_index:
     render_stroke_index_analysis()
+
+with tab_all_time:
+    render_all_time_records()

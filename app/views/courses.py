@@ -1,13 +1,11 @@
-import re
-
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 
 from app.calculations.handicap_data import get_full_handicap_history
 from app.calculations.scoring import CATEGORY_ORDER, hole_score_distribution
 from app.calculations.streaks import best_streak, best_streaks_by_round, max_consecutive_holes
+from app.views.table_components import render_table_with_fixed_total
 from database.queries import get_courses_with_hole_score_data, get_hole_info
 
 _CATEGORY_COLORS = {
@@ -49,93 +47,6 @@ def _count_with_pct(counts: pd.DataFrame, key, category: str, total: int) -> str
     count = int(counts.loc[key, category]) if key in counts.index else 0
     pct = round(100 * count / total) if total else 0
     return f"{count} ({pct}%)"
-
-
-def _sort_key(value) -> str:
-    """Extract a sortable value from a table cell: numbers sort numerically,
-    'N (P%)' cells sort by the count N, everything else sorts as text.
-    """
-    if isinstance(value, (int, float)):
-        return str(value)
-    text = str(value).strip()
-    if re.fullmatch(r"-?\d+(\.\d+)?", text):
-        return text
-    match = re.match(r"^(-?\d+(\.\d+)?)\s*\(", text)
-    if match:
-        return match.group(1)
-    return text.lower()
-
-
-def _render_table_with_fixed_total(rows: list[dict], total_row: dict, table_id: str):
-    """Render `rows` as a click-to-sort table with `total_row` permanently
-    pinned as the last row, no header of its own, and no gap from the row
-    above it.
-
-    st.dataframe can't pin a row (sorting could move a Total row out of
-    place) or hide its header, and two separate st.dataframe widgets can't
-    be guaranteed to line up column-for-column since each auto-sizes
-    independently. This renders one HTML table with real click-to-sort via
-    embedded JS instead -- st.markdown doesn't reliably execute <script>
-    tags, so this uses st.components.v1.html, which runs in a real iframe.
-    The Total row lives in its own <tbody> that the sort script never
-    touches, so it always stays last regardless of how the data is sorted.
-    """
-    columns = list(rows[0].keys())
-
-    def _cells(row: dict, *, bold: bool = False) -> str:
-        style = "font-weight:600;" if bold else ""
-        return "".join(
-            f"<td data-value=\"{_sort_key(row[col])}\" style='padding:4px 8px;{style}"
-            f"{'' if col == 'Hole' else 'text-align:right;'}'>{row[col]}</td>"
-            for col in columns
-        )
-
-    header_cells = "".join(
-        f"<th style='text-align:{'left' if col == 'Hole' else 'right'};padding:4px 8px;"
-        f"cursor:pointer;user-select:none;' onclick=\"sortTable_{table_id}({i})\">{col}</th>"
-        for i, col in enumerate(columns)
-    )
-    data_rows = "".join(f"<tr>{_cells(row)}</tr>" for row in rows)
-    total_row_html = f"<tr>{_cells(total_row, bold=True)}</tr>"
-
-    row_height = 35
-    height = (len(rows) + 2) * row_height + 20
-
-    html = f"""
-    <div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;color:#0b0b0b;">
-    <table style='width:100%;border-collapse:collapse;font-size:0.9rem;'>
-        <thead id="header-{table_id}"><tr>{header_cells}</tr></thead>
-        <tbody id="data-body-{table_id}">{data_rows}</tbody>
-        <tbody>{total_row_html}</tbody>
-    </table>
-    </div>
-    <script>
-    function sortTable_{table_id}(colIndex) {{
-        const tbody = document.getElementById('data-body-{table_id}');
-        const ths = document.getElementById('header-{table_id}').querySelectorAll('th');
-        const ascending = !(tbody.getAttribute('data-sort-col') == colIndex
-                             && tbody.getAttribute('data-sort-dir') === 'asc');
-
-        const rows = Array.from(tbody.querySelectorAll('tr'));
-        rows.sort((a, b) => {{
-            const x = a.children[colIndex].getAttribute('data-value');
-            const y = b.children[colIndex].getAttribute('data-value');
-            const nx = parseFloat(x), ny = parseFloat(y);
-            const result = (!isNaN(nx) && !isNaN(ny)) ? (nx - ny) : x.localeCompare(y);
-            return ascending ? result : -result;
-        }});
-        rows.forEach(r => tbody.appendChild(r));
-        tbody.setAttribute('data-sort-col', colIndex);
-        tbody.setAttribute('data-sort-dir', ascending ? 'asc' : 'desc');
-
-        ths.forEach((th, i) => {{
-            th.innerText = th.innerText.replace(/ [\\u25b2\\u25bc]$/, '');
-            if (i === colIndex) {{ th.innerText += ascending ? ' \\u25b2' : ' \\u25bc'; }}
-        }});
-    }}
-    </script>
-    """
-    components.html(html, height=height)
 
 
 def _no_data_message():
@@ -233,7 +144,7 @@ def _render_by_hole(capped_holes_df: pd.DataFrame):
         pct = round(100 * count / grand_total) if grand_total else 0
         total_row[_CATEGORY_TABLE_LABELS[category]] = f"{count} ({pct}%)"
 
-    _render_table_with_fixed_total(rows, total_row, table_id="by_hole")
+    render_table_with_fixed_total(rows, total_row, table_id="by_hole")
 
     st.subheader("Score Summary by Par Type")
 
@@ -268,7 +179,7 @@ def _render_by_hole(capped_holes_df: pd.DataFrame):
         pct = round(100 * count / par_grand_total) if par_grand_total else 0
         par_total_row[_CATEGORY_TABLE_LABELS[category]] = f"{count} ({pct}%)"
 
-    _render_table_with_fixed_total(par_rows, par_total_row, table_id="par_type")
+    render_table_with_fixed_total(par_rows, par_total_row, table_id="par_type")
 
 
 def hole_score_distribution_by_group(scores_df: pd.DataFrame, group_col: str) -> pd.DataFrame:

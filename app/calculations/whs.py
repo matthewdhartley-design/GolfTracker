@@ -118,11 +118,14 @@ def compute_handicap_trend(
     immediately *before* that round (a genuinely sequential, rolling
     computation -- capping round N affects the index used to cap round N+1).
     Capping requires `hole_df` to have a matching round_id/hole_number group
-    with par/stroke_index, a real (non-placeholder) course_par/course_rating/
-    slope_rating, and a prior Handicap Index to already exist (impossible for
-    the very first rated round). Whenever any of that is unavailable, the
-    round's raw total_score is used unchanged -- this is a deliberate
-    fallback, not an error.
+    with all 18 holes present (a partial set, e.g. 16 of 18 holes recorded,
+    would silently sum to far less than the real round and produce a bogus
+    low differential -- summing only what's there is not the same as
+    capping), par/stroke_index, a real (non-placeholder) course_par/
+    course_rating/slope_rating, and a prior Handicap Index to already exist
+    (impossible for the very first rated round). Whenever any of that is
+    unavailable, the round's raw total_score is used unchanged -- this is a
+    deliberate fallback, not an error.
 
     rounds_result columns (one row per round):
     - effective_score: the score actually used for this round's differential
@@ -169,6 +172,7 @@ def compute_handicap_trend(
         hole_group = holes_by_round.get(row.round_id)
         can_cap = (
             hole_group is not None
+            and len(hole_group) == 18
             and prior_index is not None
             and not _is_placeholder(row.course_par)
             and not _is_placeholder(row.course_rating)

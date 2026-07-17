@@ -117,6 +117,19 @@ def upsert_hole_info(course_name: str, tee_color: str, holes: list[dict]) -> Non
         conn.commit()
 
 
+def get_course_tees() -> pd.DataFrame:
+    """Fetch all golf.golf_course_tees rows (course/tee-level par, yardage,
+    course rating, slope rating), sorted by course and tee.
+    """
+    query = """
+        SELECT course_name, tee_color, par, yardage, course_rating, slope_rating
+        FROM golf.golf_course_tees
+        ORDER BY course_name, tee_color
+    """
+    with get_db_connection() as conn:
+        return pd.read_sql(query, conn)
+
+
 def get_known_course_tees() -> pd.DataFrame:
     """List all (course_name, tee_color) combos from golf.golf_course_tees,
     for populating course/tee selection dropdowns.

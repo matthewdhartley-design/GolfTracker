@@ -1,8 +1,14 @@
+import json
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
+from app.calculations.streaks import STREAK_CATEGORIES, category_streaks
 from app.calculations.whs import compute_handicap_trend
+from app.views.course_preview import render_course_preview
+from app.views.table_components import scorecard_html
 from database.queries import get_all_hole_scores_with_par, get_macro_rounds
 
 _X_AXIS_OPTIONS = {"Date": "date", "Round ID": "round_id"}
@@ -17,13 +23,58 @@ _ZOOM_PRESETS = [
 _ZOOM_MONTHS = {"m3": 3, "m6": 6, "m12": 12}
 
 
-def _rounds_table_html(rated_df: pd.DataFrame) -> str:
-    """Build an HTML table of rounds, most recent first, with a colored dot
-    next to the score differential when that round currently counts toward
-    the low (green) or high (red) handicap, and a yellow divider marking the
+def _round_detail_html(round_holes: pd.DataFrame) -> str:
+    """Build the expanded detail shown under a clicked round: a classic
+    horizontal scorecard (gross scores, front 9 then back 9) plus a callout
+    of the longest streak achieved in that round for each category.
+
+    Streaks qualify on net-double-bogey-capped scores (WHS Rule 3.1), same
+    convention as the rest of this app, but the scorecard itself shows real,
+    uncapped strokes.
+    """
+    ordered = round_holes.sort_values("hole_number")
+    scorecard = scorecard_html(ordered)
+
+    capped_for_streaks = ordered.rename(columns={"score": "raw_score", "capped_score": "score"})
+    streak_lines = []
+    for label, max_to_par in STREAK_CATEGORIES:
+        runs = category_streaks(capped_for_streaks, max_to_par)
+        if not runs:
+            streak_lines.append(f"<div><b>{label}:</b> none</div>")
+            continue
+        best = max(runs, key=lambda r: r["length"])
+        streak_lines.append(
+            f"<div><b>{label}:</b> {best['length']} hole(s) "
+            f"(Holes {best['start_hole']}-{best['end_hole']})</div>"
+        )
+
+    return (
+        "<div style='padding:8px 4px;'>"
+        f"{scorecard}"
+        "<div style='margin-top:4px;font-size:0.85rem;'>"
+        f"{''.join(streak_lines)}"
+        "</div></div>"
+    )
+
+
+def _rounds_table_component(rated_df: pd.DataFrame, capped_holes_df: pd.DataFrame):
+    """Render the rounds table, most recent first, with a colored dot next
+    to the score differential when that round currently counts toward the
+    low (green) or high (red) handicap, and a yellow divider marking the
     boundary between the current 20-round window and everything older.
+
+    Clicking a row splits the table and shows that round's scorecard and
+    per-round streak callouts in the gap between it and the next row --
+    st.markdown doesn't reliably execute <script> tags, so this uses
+    st.components.v1.html, which runs in a real iframe (same technique as
+    the shared sortable-table component).
     """
     table_df = rated_df.sort_values("date", ascending=False).reset_index(drop=True)
+
+    round_details = {}
+    if capped_holes_df is not None and not capped_holes_df.empty:
+        for round_id, group in capped_holes_df.groupby("round_id"):
+            round_details[int(round_id)] = _round_detail_html(group)
 
     header = (
         "<tr>"
@@ -49,10 +100,11 @@ def _rounds_table_html(rated_df: pd.DataFrame) -> str:
 
         date_str = pd.Timestamp(row["date"]).strftime("%d-%b-%y")
         row_style = "border-bottom:2px solid #eda100;" if i == 19 and len(table_df) > 20 else ""
+        round_id = int(row["round_id"])
 
         rows.append(
-            f"<tr style='{row_style}'>"
-            f"<td style='padding:4px 8px;'>{row['round_id']}</td>"
+            f"<tr style='cursor:pointer;{row_style}' onclick=\"toggleRoundDetail(this, {round_id})\">"
+            f"<td style='padding:4px 8px;'>{round_id}</td>"
             f"<td style='padding:4px 8px;'>{date_str}</td>"
             f"<td style='padding:4px 8px;'>{row['course_name']}</td>"
             f"<td style='padding:4px 8px;'>{row['tee_color_played']}</td>"
@@ -63,12 +115,56 @@ def _rounds_table_html(rated_df: pd.DataFrame) -> str:
             "</tr>"
         )
 
-    return (
-        "<div style='max-height:500px;overflow-y:auto;'>"
-        "<table style='width:100%;border-collapse:collapse;font-size:0.9rem;'>"
-        f"<thead>{header}</thead><tbody>{''.join(rows)}</tbody>"
-        "</table></div>"
-    )
+    no_data_message = "No hole-by-hole data recorded for this round."
+    html = f"""
+    <style>
+        html, body {{
+            margin: 0;
+            background-color: #ffffff;
+            color: #31333f;
+            font-family: system-ui,-apple-system,'Segoe UI',sans-serif;
+        }}
+        @media (prefers-color-scheme: dark) {{
+            html, body {{ background-color: #0e1117; color: #fafafa; }}
+        }}
+        .rounds-scroll {{
+            scrollbar-width: none;   /* Firefox */
+            -ms-overflow-style: none; /* old Edge/IE */
+        }}
+        .rounds-scroll::-webkit-scrollbar {{
+            display: none;   /* Chrome/Safari/new Edge */
+        }}
+    </style>
+    <div class="rounds-scroll" style="max-height:500px;overflow-y:auto;">
+    <table style='width:100%;border-collapse:collapse;font-size:0.9rem;'>
+        <thead>{header}</thead>
+        <tbody id="rounds-tbody">{''.join(rows)}</tbody>
+    </table>
+    </div>
+    <script>
+    const roundDetails = {json.dumps(round_details)};
+    let openDetailRow = null;
+    function toggleRoundDetail(rowEl, roundId) {{
+        const existing = rowEl.nextElementSibling;
+        if (existing && existing.classList.contains('detail-row')) {{
+            existing.remove();
+            openDetailRow = null;
+            return;
+        }}
+        if (openDetailRow) {{ openDetailRow.remove(); }}
+
+        const tr = document.createElement('tr');
+        tr.className = 'detail-row';
+        const td = document.createElement('td');
+        td.colSpan = 8;
+        td.innerHTML = roundDetails[roundId] || "<div style='padding:8px;'>{no_data_message}</div>";
+        tr.appendChild(td);
+        rowEl.parentNode.insertBefore(tr, rowEl.nextSibling);
+        openDetailRow = tr;
+    }}
+    </script>
+    """
+    components.html(html, height=550)
 
 
 def _zoom_x_range(rated_df: pd.DataFrame, x_col: str, zoom: str | None):
@@ -96,8 +192,8 @@ def _zoom_x_range(rated_df: pd.DataFrame, x_col: str, zoom: str | None):
     return x_min, x_max
 
 
-def render_dashboard():
-    """Render the Macro Trends tab."""
+def _render_trends():
+    """Render the Trends sub-tab (the original Macro Trends content)."""
     rounds_df = get_macro_rounds()
 
     if rounds_df.empty:
@@ -292,4 +388,15 @@ def render_dashboard():
     with chart_col:
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown(_rounds_table_html(rated_df), unsafe_allow_html=True)
+    _rounds_table_component(rated_df, capped_holes_df)
+
+
+def render_dashboard():
+    """Render the Macro Trends tab."""
+    tab_trends, tab_course_preview = st.tabs(["Trends", "Course Preview"])
+
+    with tab_trends:
+        _render_trends()
+
+    with tab_course_preview:
+        render_course_preview()
