@@ -170,17 +170,24 @@ def create_round(round_date, course_name: str, tee_color: str, total_score: int)
 
 def upsert_hole_details(round_id: int, holes: list[dict]) -> None:
     """Insert or update golf.golf_hole_details rows for a round.
-    `holes` is a list of dicts with keys hole_number, score.
+    `holes` is a list of dicts with keys hole_number, score, and optionally
+    is_estimated (defaults to False) -- True marks a hole score that wasn't
+    actually recorded (e.g. picked up) and was instead imputed as net double
+    bogey per WHS Rule 3.1, so it can be shown to the user with an asterisk.
     """
     query = text("""
-        INSERT INTO golf.golf_hole_details (round_id, hole_number, score)
-        VALUES (:round_id, :hole_number, :score)
-        ON CONFLICT (round_id, hole_number) DO UPDATE SET score = EXCLUDED.score
+        INSERT INTO golf.golf_hole_details (round_id, hole_number, score, is_estimated)
+        VALUES (:round_id, :hole_number, :score, :is_estimated)
+        ON CONFLICT (round_id, hole_number) DO UPDATE
+        SET score = EXCLUDED.score, is_estimated = EXCLUDED.is_estimated
     """)
     with get_db_connection() as conn:
         for hole in holes:
             conn.execute(query, {
-                "round_id": round_id, "hole_number": hole["hole_number"], "score": hole["score"],
+                "round_id": round_id,
+                "hole_number": hole["hole_number"],
+                "score": hole["score"],
+                "is_estimated": hole.get("is_estimated", False),
             })
         conn.commit()
 
@@ -226,11 +233,13 @@ def get_all_hole_scores_with_par() -> pd.DataFrame:
     across every round that has both hole-level scores (golf_hole_details)
     and matching hole-level info (golf_hole_info) for the course/tee it was
     played on, tagged with round_id/date/course_name/tee_color_played/
-    total_score so callers can group by round.
+    total_score so callers can group by round. is_estimated marks a hole
+    score that wasn't actually recorded and was instead imputed as net
+    double bogey per WHS Rule 3.1 (see round_completion.py).
     """
     query = """
         SELECT r.round_id, r.date, r.course_name, r.tee_color_played, r.total_score,
-               d.hole_number, d.score, hi.par, hi.yardage, hi.stroke_index
+               d.hole_number, d.score, hi.par, hi.yardage, hi.stroke_index, d.is_estimated
         FROM golf.golf_hole_details d
         JOIN golf.golf_rounds r ON d.round_id = r.round_id
         JOIN golf.golf_hole_info hi
@@ -249,10 +258,16 @@ def get_macro_rounds() -> pd.DataFrame:
     Uses a LEFT JOIN so rounds without a matching golf_course_tees row still
     appear (with null course_rating/slope_rating/course_par) rather than
     disappearing from totals and best-score stats.
+
+    excluded_from_handicap marks a round that should count toward totals/
+    round counts but be dropped from rated_df (handicap/score-differential)
+    calculations specifically -- e.g. a round with real hole scores but no
+    course hole_info to cap or impute missing holes against.
     """
     query = """
         SELECT r.round_id, r.date, r.course_name, r.tee_color_played,
-               r.total_score, r.handicap_after_round,
+               r.total_score, r.handicap_after_round, r.excluded_from_handicap,
+               r.competition_name,
                t.course_rating, t.slope_rating, t.par AS course_par
         FROM golf.golf_rounds r
         LEFT JOIN golf.golf_course_tees t

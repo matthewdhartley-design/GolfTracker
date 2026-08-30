@@ -1,14 +1,12 @@
-import json
-
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 
-from app.calculations.streaks import STREAK_CATEGORIES, category_streaks
+from app.calculations.handicap_data import get_full_handicap_history
 from app.calculations.whs import compute_handicap_trend
 from app.views.course_preview import render_course_preview
-from app.views.table_components import scorecard_html
+from app.views.scoring_trends import render_scoring_trends
+from app.views.table_components import expandable_rounds_table_html, round_detail_html
 from database.queries import get_all_hole_scores_with_par, get_macro_rounds
 
 _X_AXIS_OPTIONS = {"Date": "date", "Round ID": "round_id"}
@@ -22,73 +20,63 @@ _ZOOM_PRESETS = [
 ]
 _ZOOM_MONTHS = {"m3": 3, "m6": 6, "m12": 12}
 
+# CCC's own rules: any CCC competition round counts toward the "5 qualifying
+# competition rounds in the last 12 months" entry requirement for anything
+# else (e.g. Club Champs, Captains Day) -- including Monthly Medal/Monthly
+# Stableford. But once you've fallen below the requirement, only Monthly
+# Medal/Monthly Stableford rounds are open-entry enough to rebuild it back
+# up -- the other competitions require already having 5 to enter.
+_MONTHLY_COMPETITIONS = {"Monthly Medal", "Monthly Stableford"}
+_QUALIFYING_ROUNDS_REQUIRED = 5
 
-def _round_detail_html(round_holes: pd.DataFrame) -> str:
-    """Build the expanded detail shown under a clicked round: a classic
-    horizontal scorecard (gross scores, front 9 then back 9) plus a callout
-    of the longest streak achieved in that round for each category.
 
-    Streaks qualify on net-double-bogey-capped scores (WHS Rule 3.1), same
-    convention as the rest of this app, but the scorecard itself shows real,
-    uncapped strokes.
+def _ccc_competition_eligibility(full_rounds_df: pd.DataFrame) -> dict:
+    """How many CCC competition rounds have been played in the trailing 12
+    months, and -- if that currently meets the 5-round entry requirement --
+    the date the count will drop below 5 again if no further rounds are
+    played.
+
+    Each qualifying round "expires" (drops out of the trailing-12-month
+    window) 12 months after it was played. Sorting those expiry dates
+    ascending, the count only first falls below the requirement once
+    (N - (required - 1)) of them have expired -- i.e. the date returned is
+    the (N - required + 1)'th soonest expiry date.
     """
-    ordered = round_holes.sort_values("hole_number")
-    scorecard = scorecard_html(ordered)
+    qualifying = full_rounds_df[
+        (full_rounds_df["course_name"] == "CCC") & full_rounds_df["competition_name"].notna()
+    ]
 
-    capped_for_streaks = ordered.rename(columns={"score": "raw_score", "capped_score": "score"})
-    streak_lines = []
-    for label, max_to_par in STREAK_CATEGORIES:
-        runs = category_streaks(capped_for_streaks, max_to_par)
-        if not runs:
-            streak_lines.append(f"<div><b>{label}:</b> none</div>")
-            continue
-        best = max(runs, key=lambda r: r["length"])
-        streak_lines.append(
-            f"<div><b>{label}:</b> {best['length']} hole(s) "
-            f"(Holes {best['start_hole']}-{best['end_hole']})</div>"
-        )
+    today = pd.Timestamp.today().normalize()
+    cutoff = today - pd.DateOffset(months=12)
+    recent = qualifying[pd.to_datetime(qualifying["date"]) >= cutoff]
+    count = len(recent)
 
-    return (
-        "<div style='padding:8px 4px;'>"
-        f"{scorecard}"
-        "<div style='margin-top:4px;font-size:0.85rem;'>"
-        f"{''.join(streak_lines)}"
-        "</div></div>"
-    )
+    result = {"count": count, "required": _QUALIFYING_ROUNDS_REQUIRED, "drop_below_date": None}
+    if count >= _QUALIFYING_ROUNDS_REQUIRED:
+        expiry_dates = sorted(pd.to_datetime(recent["date"]) + pd.DateOffset(months=12))
+        idx = count - _QUALIFYING_ROUNDS_REQUIRED
+        result["drop_below_date"] = expiry_dates[idx]
+    return result
 
 
-def _rounds_table_component(rated_df: pd.DataFrame, capped_holes_df: pd.DataFrame):
+def _rounds_table_component(rated_df: pd.DataFrame, capped_holes_df: pd.DataFrame, global_rated_df: pd.DataFrame):
     """Render the rounds table, most recent first, with a colored dot next
     to the score differential when that round currently counts toward the
     low (green) or high (red) handicap, and a yellow divider marking the
     boundary between the current 20-round window and everything older.
 
-    Clicking a row splits the table and shows that round's scorecard and
-    per-round streak callouts in the gap between it and the next row --
-    st.markdown doesn't reliably execute <script> tags, so this uses
-    st.components.v1.html, which runs in a real iframe (same technique as
-    the shared sortable-table component).
+    Clicking a row splits the table and shows that round's scorecard,
+    per-round streak callouts, and ranking stats in the gap between it and
+    the next row.
     """
     table_df = rated_df.sort_values("date", ascending=False).reset_index(drop=True)
 
     round_details = {}
     if capped_holes_df is not None and not capped_holes_df.empty:
         for round_id, group in capped_holes_df.groupby("round_id"):
-            round_details[int(round_id)] = _round_detail_html(group)
+            round_details[int(round_id)] = round_detail_html(int(round_id), group, global_rated_df)
 
-    header = (
-        "<tr>"
-        "<th style='text-align:left;padding:4px 8px;'>Round ID</th>"
-        "<th style='text-align:left;padding:4px 8px;'>Date</th>"
-        "<th style='text-align:left;padding:4px 8px;'>Course</th>"
-        "<th style='text-align:left;padding:4px 8px;'>Tee</th>"
-        "<th style='text-align:right;padding:4px 8px;'>Score</th>"
-        "<th style='text-align:right;padding:4px 8px;'>Score Differential</th>"
-        "<th style='text-align:right;padding:4px 8px;'>Low Handicap</th>"
-        "<th style='text-align:right;padding:4px 8px;'>High Handicap</th>"
-        "</tr>"
-    )
-
+    columns = ["Round ID", "Date", "Course", "Tee", "Score", "Score Differential", "Low Handicap", "High Handicap"]
     rows = []
     for i, row in table_df.iterrows():
         if row["counts_toward_handicap"]:
@@ -98,73 +86,20 @@ def _rounds_table_component(rated_df: pd.DataFrame, capped_holes_df: pd.DataFram
         else:
             dot = ""
 
-        date_str = pd.Timestamp(row["date"]).strftime("%d-%b-%y")
-        row_style = "border-bottom:2px solid #eda100;" if i == 19 and len(table_df) > 20 else ""
-        round_id = int(row["round_id"])
+        rows.append({
+            "_round_id": int(row["round_id"]),
+            "_row_style": "border-bottom:2px solid #eda100;" if i == 19 and len(table_df) > 20 else "",
+            "Round ID": int(row["round_id"]),
+            "Date": pd.Timestamp(row["date"]).strftime("%d-%b-%y"),
+            "Course": row["course_name"],
+            "Tee": row["tee_color_played"],
+            "Score": row["total_score"],
+            "Score Differential": f"{row['score_differential']:.1f}{dot}",
+            "Low Handicap": f"{row['whs_handicap_index']:.1f}",
+            "High Handicap": f"{row['high_handicap_index']:.1f}",
+        })
 
-        rows.append(
-            f"<tr style='cursor:pointer;{row_style}' onclick=\"toggleRoundDetail(this, {round_id})\">"
-            f"<td style='padding:4px 8px;'>{round_id}</td>"
-            f"<td style='padding:4px 8px;'>{date_str}</td>"
-            f"<td style='padding:4px 8px;'>{row['course_name']}</td>"
-            f"<td style='padding:4px 8px;'>{row['tee_color_played']}</td>"
-            f"<td style='text-align:right;padding:4px 8px;'>{row['total_score']}</td>"
-            f"<td style='text-align:right;padding:4px 8px;'>{row['score_differential']:.1f}{dot}</td>"
-            f"<td style='text-align:right;padding:4px 8px;'>{row['whs_handicap_index']:.1f}</td>"
-            f"<td style='text-align:right;padding:4px 8px;'>{row['high_handicap_index']:.1f}</td>"
-            "</tr>"
-        )
-
-    no_data_message = "No hole-by-hole data recorded for this round."
-    html = f"""
-    <style>
-        html, body {{
-            margin: 0;
-            background-color: #ffffff;
-            color: #31333f;
-            font-family: system-ui,-apple-system,'Segoe UI',sans-serif;
-        }}
-        @media (prefers-color-scheme: dark) {{
-            html, body {{ background-color: #0e1117; color: #fafafa; }}
-        }}
-        .rounds-scroll {{
-            scrollbar-width: none;   /* Firefox */
-            -ms-overflow-style: none; /* old Edge/IE */
-        }}
-        .rounds-scroll::-webkit-scrollbar {{
-            display: none;   /* Chrome/Safari/new Edge */
-        }}
-    </style>
-    <div class="rounds-scroll" style="max-height:500px;overflow-y:auto;">
-    <table style='width:100%;border-collapse:collapse;font-size:0.9rem;'>
-        <thead>{header}</thead>
-        <tbody id="rounds-tbody">{''.join(rows)}</tbody>
-    </table>
-    </div>
-    <script>
-    const roundDetails = {json.dumps(round_details)};
-    let openDetailRow = null;
-    function toggleRoundDetail(rowEl, roundId) {{
-        const existing = rowEl.nextElementSibling;
-        if (existing && existing.classList.contains('detail-row')) {{
-            existing.remove();
-            openDetailRow = null;
-            return;
-        }}
-        if (openDetailRow) {{ openDetailRow.remove(); }}
-
-        const tr = document.createElement('tr');
-        tr.className = 'detail-row';
-        const td = document.createElement('td');
-        td.colSpan = 8;
-        td.innerHTML = roundDetails[roundId] || "<div style='padding:8px;'>{no_data_message}</div>";
-        tr.appendChild(td);
-        rowEl.parentNode.insertBefore(tr, rowEl.nextSibling);
-        openDetailRow = tr;
-    }}
-    </script>
-    """
-    components.html(html, height=550)
+    expandable_rounds_table_html(columns, rows, round_details, table_id="macro_trends_rounds")
 
 
 def _zoom_x_range(rated_df: pd.DataFrame, x_col: str, zoom: str | None):
@@ -192,6 +127,39 @@ def _zoom_x_range(rated_df: pd.DataFrame, x_col: str, zoom: str | None):
     return x_min, x_max
 
 
+def _render_competition_eligibility(full_rounds_df: pd.DataFrame):
+    """Show whether the CCC "5 qualifying competition rounds in the last 12
+    months" entry requirement is currently met, and if so, the date it'll
+    stop being met (assuming no further qualifying rounds are played).
+    Uses the full, unfiltered round history -- independent of the course/
+    tee/year filters below, since eligibility is a real-world fact, not a
+    view of the chart.
+    """
+    eligibility = _ccc_competition_eligibility(full_rounds_df)
+    count, required = eligibility["count"], eligibility["required"]
+
+    col1, col2 = st.columns(2)
+    col1.metric(
+        "CCC Qualifying Competition Rounds (Last 12mo)",
+        f"{count} / {required}",
+        help="Any CCC competition round in the last 12 months, including Monthly Medal/Monthly "
+             "Stableford -- the requirement to enter anything else (Club Champs, Captains Day, etc.).",
+    )
+    if eligibility["drop_below_date"] is not None:
+        col2.metric(
+            "Qualifying Drops Below 5 On",
+            eligibility["drop_below_date"].strftime("%d-%b-%y"),
+            help="The date your oldest currently-counting round ages out of the trailing 12-month "
+                 "window, assuming no new competition rounds are played before then.",
+        )
+    else:
+        col2.warning(
+            f"Not enough qualifying rounds -- need {required - count} more. "
+            "Only Monthly Medal/Monthly Stableford rounds are open-entry enough to rebuild this "
+            "from below the requirement."
+        )
+
+
 def _render_trends():
     """Render the Trends sub-tab (the original Macro Trends content)."""
     rounds_df = get_macro_rounds()
@@ -199,6 +167,8 @@ def _render_trends():
     if rounds_df.empty:
         st.info("No rounds found yet. Log a round to see your macro trends.")
         return
+
+    _render_competition_eligibility(rounds_df)
 
     course_options = sorted(rounds_df["course_name"].dropna().unique().tolist())
     tee_options = sorted(rounds_df["tee_color_played"].dropna().unique().tolist())
@@ -239,6 +209,7 @@ def _render_trends():
     rated_df = rounds_df[
         rounds_df["course_rating"].notna() & (rounds_df["course_rating"] != 0)
         & rounds_df["slope_rating"].notna() & (rounds_df["slope_rating"] != 0)
+        & ~rounds_df["excluded_from_handicap"]
     ].sort_values("date")
 
     if not rated_df.empty:
@@ -274,7 +245,7 @@ def _render_trends():
     with button_col:
         st.write("Zoom to:")
         for label, key in _ZOOM_PRESETS:
-            if st.button(label, use_container_width=True, key=f"zoom_btn_{key}"):
+            if st.button(label, width="stretch", key=f"zoom_btn_{key}"):
                 st.session_state["macro_trends_zoom"] = key
 
     low_counting = rated_df[rated_df["counts_toward_handicap"]]
@@ -386,17 +357,23 @@ def _render_trends():
     )
 
     with chart_col:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
-    _rounds_table_component(rated_df, capped_holes_df)
+    global_rated_df, _ = get_full_handicap_history()
+    _rounds_table_component(rated_df, capped_holes_df, global_rated_df)
 
 
 def render_dashboard():
     """Render the Macro Trends tab."""
-    tab_trends, tab_course_preview = st.tabs(["Trends", "Course Preview"])
+    tab_trends, tab_course_preview, tab_scoring_trends = st.tabs(
+        ["Trends", "Course Preview", "Scoring Trends"]
+    )
 
     with tab_trends:
         _render_trends()
 
     with tab_course_preview:
         render_course_preview()
+
+    with tab_scoring_trends:
+        render_scoring_trends()

@@ -10,7 +10,8 @@ def get_full_handicap_history() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     Returns (rated_df, capped_holes_df) -- see compute_handicap_trend for
     columns. Rounds with placeholder/missing course_rating, slope_rating, or
-    course_par are excluded from rated_df (same treatment as Macro Trends).
+    course_par are excluded from rated_df (same treatment as Macro Trends),
+    as are rounds explicitly flagged excluded_from_handicap.
 
     This is the *global* history (not filtered to a course/tee/year, unlike
     Macro Trends' deliberately-filtered recomputation) -- callers that only
@@ -24,6 +25,7 @@ def get_full_handicap_history() -> tuple[pd.DataFrame, pd.DataFrame]:
     rated_df = rounds_df[
         rounds_df["course_rating"].notna() & (rounds_df["course_rating"] != 0)
         & rounds_df["slope_rating"].notna() & (rounds_df["slope_rating"] != 0)
+        & ~rounds_df["excluded_from_handicap"]
     ].sort_values("date")
 
     if rated_df.empty:

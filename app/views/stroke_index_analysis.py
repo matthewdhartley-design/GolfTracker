@@ -71,4 +71,4 @@ def render_stroke_index_analysis():
         xaxis=dict(tickmode="linear", tick0=1, dtick=1),
         margin=dict(b=60),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")

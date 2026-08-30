@@ -118,7 +118,7 @@ def render_course_preview():
             f"R² = {model.r_squared:.3f}, Adjusted R² = {model.adj_r_squared:.3f}, "
             f"fit on {model.n_obs} holes."
         )
-        st.dataframe(pd.DataFrame(model.coefficient_rows()), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(model.coefficient_rows()), hide_index=True, width="stretch")
 
     current_handicap = rated_df.iloc[-1]["whs_handicap_index"] if not rated_df.empty else None
 
@@ -183,7 +183,7 @@ def render_course_preview():
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
         margin=dict(b=100),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     rows = [
         {

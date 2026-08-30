@@ -73,7 +73,7 @@ def _render_rounds_overview():
         "hole_scores_recorded": "Hole Scores Recorded",
     })
 
-    st.dataframe(table_df, use_container_width=True, hide_index=True)
+    st.dataframe(table_df, width="stretch", hide_index=True)
 
 
 def _render_scorecards():
@@ -99,7 +99,7 @@ def _render_scorecards():
         index=pd.Index(["Par", "Yardage", "Stroke Index"], name="Hole"),
         columns=hole_cols,
     ).astype(str)
-    st.dataframe(scorecard_wide, use_container_width=True)
+    st.dataframe(scorecard_wide, width="stretch")
 
     st.subheader("Courses Missing Hole-by-Hole Data")
     st.caption(
@@ -119,7 +119,7 @@ def _render_scorecards():
             "hole_count": "Holes Recorded",
         })
         st.warning(f"{len(incomplete_display)} course/tee row(s) need hole-by-hole data.")
-        st.dataframe(incomplete_display, use_container_width=True, hide_index=True)
+        st.dataframe(incomplete_display, width="stretch", hide_index=True)
 
         st.subheader("Add Hole-by-Hole Data")
         _render_hole_entry_form(incomplete)
@@ -148,7 +148,7 @@ def _render_hole_entry_form(incomplete: pd.DataFrame):
             hide_index=True,
             num_rows="fixed",
             disabled=["Hole"],
-            use_container_width=True,
+            width="stretch",
         )
         submitted = st.form_submit_button("Submit")
 

@@ -79,4 +79,4 @@ def render_yardage_analysis():
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
         margin=dict(b=100),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")

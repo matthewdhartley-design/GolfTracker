@@ -2,14 +2,33 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 from scipy import stats
 
 from app.calculations.handicap_data import get_full_handicap_history
 from app.calculations.streaks import STREAK_CATEGORIES, category_streaks
-from app.views.table_components import scorecard_html
+from app.views.table_components import expandable_rounds_table_html, round_detail_html, scorecard_html
 
-_BIN_WIDTH = 2.0
+_BIN_WIDTH = 1.0
+_ROUNDS_TABLE_COLUMNS = ["All-Time Rank", "Date", "Course", "Tee", "Score", "Score Differential"]
+
+
+def _round_rows(subset: pd.DataFrame) -> list[dict]:
+    """Format rows for a rated_df subset (with an 'all_time_rank' column
+    already attached) into display dicts, sorted best (lowest differential)
+    first."""
+    subset = subset.sort_values("score_differential")
+    return [
+        {
+            "_round_id": int(row.round_id),
+            "All-Time Rank": int(row.all_time_rank),
+            "Date": pd.Timestamp(row.date).strftime("%d-%b-%y"),
+            "Course": row.course_name,
+            "Tee": row.tee_color_played,
+            "Score": int(row.total_score),
+            "Score Differential": row.score_differential,
+        }
+        for row in subset.itertuples()
+    ]
 
 
 def _compute_streaks_by_category(capped_holes_df: pd.DataFrame) -> dict:
@@ -106,7 +125,7 @@ def _render_scorecard(round_holes: pd.DataFrame, start_hole: int, end_hole: int)
     {scorecard_html(display_holes, start_hole, end_hole)}
     </div>
     """
-    components.html(html, height=310)
+    st.iframe(html, height="content")
 
 
 def render_all_time_records():
@@ -114,7 +133,7 @@ def render_all_time_records():
     across your entire recorded history, with a fitted normal ("bell curve")
     overlay for reference.
     """
-    rated_df, _ = get_full_handicap_history()
+    rated_df, capped_holes_df = get_full_handicap_history()
 
     if rated_df.empty:
         st.info("No rated rounds yet -- nothing to show here.")
@@ -128,7 +147,10 @@ def render_all_time_records():
         _BIN_WIDTH,
     )
     counts, edges = np.histogram(diffs, bins=bin_edges)
-    bin_centers = (edges[:-1] + edges[1:]) / 2
+    # Bucket by the whole-number part of the differential (e.g. 20.7 falls in
+    # the "20" bucket) -- label each bar with that integer, not a fractional
+    # bin center.
+    bin_lefts = edges[:-1].astype(int)
 
     mean, std = diffs.mean(), diffs.std()
     x_curve = np.linspace(edges[0], edges[-1], 200)
@@ -136,11 +158,12 @@ def render_all_time_records():
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=bin_centers,
+        x=bin_lefts,
         y=counts,
         width=_BIN_WIDTH * 0.9,
         name="Rounds",
         marker_color="#2a78d6",
+        hovertemplate="Score Differential %{x}<br>Rounds: %{y}<extra></extra>",
     ))
     fig.add_trace(go.Scatter(
         x=x_curve,
@@ -153,17 +176,44 @@ def render_all_time_records():
         title="Distribution of Score Differentials",
         xaxis_title="Score Differential",
         yaxis_title="Count",
+        xaxis=dict(tickmode="linear", tick0=bin_lefts[0], dtick=1),
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
         margin=dict(b=100),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    hist_event = st.plotly_chart(fig, width="stretch", on_select="rerun", selection_mode="points")
+
+    rated_df = rated_df.assign(
+        all_time_rank=rated_df["score_differential"].rank(method="min", ascending=True).astype(int)
+    )
+
+    hist_points = hist_event.selection.points if hist_event.selection else []
+    if hist_points:
+        bucket = int(hist_points[0]["x"])
+        bucket_rounds = rated_df[
+            (rated_df["score_differential"] >= bucket) & (rated_df["score_differential"] < bucket + 1)
+        ]
+        st.subheader(f"Rounds with a Score Differential of {bucket}-{bucket + 1}")
+        table_df = bucket_rounds
+    else:
+        st.subheader("Top 10 Rounds of All Time")
+        st.caption("Click a bar above to see every round with that score differential instead.")
+        table_df = rated_df.nsmallest(10, "score_differential")
+
+    round_details = {}
+    if not capped_holes_df.empty:
+        table_round_ids = set(table_df["round_id"])
+        for round_id, group in capped_holes_df[capped_holes_df["round_id"].isin(table_round_ids)].groupby("round_id"):
+            round_details[int(round_id)] = round_detail_html(int(round_id), group, rated_df)
+
+    expandable_rounds_table_html(
+        _ROUNDS_TABLE_COLUMNS, _round_rows(table_df), round_details, table_id="all_time_top_rounds"
+    )
 
     st.subheader("Longest Streaks")
     st.caption(
         "Streaks qualify on net-double-bogey-capped scores (WHS Rule 3.1); "
         "Gross Score and To Par below are the real, uncapped strokes taken over those holes."
     )
-    _, capped_holes_df = get_full_handicap_history()
     if capped_holes_df.empty:
         st.info("No hole-by-hole data recorded yet.")
         return
@@ -173,7 +223,7 @@ def render_all_time_records():
     event = st.dataframe(
         pd.DataFrame(_streak_table_rows(streaks)),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         on_select="rerun",
         selection_mode="single-row-required",
     )
@@ -206,7 +256,7 @@ def render_all_time_records():
         xaxis=dict(tickmode="linear", tick0=2, dtick=1),
     )
     streak_event = st.plotly_chart(
-        streak_fig, use_container_width=True, on_select="rerun", selection_mode="points"
+        streak_fig, width="stretch", on_select="rerun", selection_mode="points"
     )
 
     selected_points = streak_event.selection.points if streak_event.selection else []
@@ -247,7 +297,7 @@ def render_all_time_records():
     detail_event = st.dataframe(
         pd.DataFrame(detail_rows),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         on_select="rerun",
         selection_mode="single-row-required",
     )

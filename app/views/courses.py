@@ -109,7 +109,7 @@ def _render_by_hole(capped_holes_df: pd.DataFrame):
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
         margin=dict(b=100),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.subheader("Hole-by-Hole Performance")
 
@@ -125,6 +125,7 @@ def _render_by_hole(capped_holes_df: pd.DataFrame):
             "Hole": str(hole),
             "Par": par_by_hole.get(hole, ""),
             "Stroke Index": stroke_index_by_hole.get(hole, ""),
+            "Times Played": total,
             "Avg Score to Par": round(avg_to_par_by_hole[hole], 2) if hole in avg_to_par_by_hole.index else None,
         }
         for category in CATEGORY_ORDER:
@@ -137,6 +138,7 @@ def _render_by_hole(capped_holes_df: pd.DataFrame):
         "Hole": "Total",
         "Par": str(int(total_par.sum())) if not total_par.empty else "",
         "Stroke Index": "",
+        "Times Played": grand_total,
         "Avg Score to Par": round(scores_df["to_par"].mean(), 2),
     }
     for category in CATEGORY_ORDER:
@@ -266,7 +268,7 @@ def _render_streaks(capped_holes_df: pd.DataFrame):
         xaxis_title="Best Streak (Strokes to Par)",
         yaxis_title="Number of Rounds",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     if selected_result is not None:
         st.caption(
             f"This round's best {length}-hole streak ({selected_result['to_par']:+d}) "

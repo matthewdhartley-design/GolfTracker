@@ -17,6 +17,18 @@ def categorize_score(score: int, par: int) -> str:
     return "Triple+ Bogey"
 
 
+def round_score_distribution(scores_df: pd.DataFrame) -> pd.DataFrame:
+    """Given a DataFrame with round_id/score/par columns (one row per hole),
+    return a table indexed by round_id with one column per CATEGORY_ORDER
+    label, counting how many holes in that round fell into each category.
+    """
+    df = scores_df.copy()
+    df["category"] = [categorize_score(s, p) for s, p in zip(df["score"], df["par"])]
+    counts = df.groupby(["round_id", "category"]).size().unstack(fill_value=0)
+    counts = counts.reindex(columns=CATEGORY_ORDER, fill_value=0)
+    return counts
+
+
 def hole_score_distribution(scores_df: pd.DataFrame) -> pd.DataFrame:
     """Given a DataFrame with hole_number/score/par columns, return a table
     indexed by hole (1-18) with one column per CATEGORY_ORDER label, counting

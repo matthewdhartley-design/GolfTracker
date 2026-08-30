@@ -1,7 +1,11 @@
+import json
 import re
 
 import pandas as pd
-import streamlit.components.v1 as components
+import streamlit as st
+
+from app.calculations.round_ranking import compute_round_rankings
+from app.calculations.streaks import STREAK_CATEGORIES, category_streaks
 
 
 def _to_par_str(score, par) -> str:
@@ -51,6 +55,11 @@ def scorecard_html(round_holes: pd.DataFrame, highlight_start: int | None = None
     par_by_hole = dict(zip(ordered["hole_number"], ordered["par"]))
     si_by_hole = dict(zip(ordered["hole_number"], ordered["stroke_index"]))
     score_by_hole = dict(zip(ordered["hole_number"], ordered["score"]))
+    estimated_holes = (
+        set(ordered.loc[ordered["is_estimated"], "hole_number"])
+        if "is_estimated" in ordered.columns
+        else set()
+    )
 
     def _plain_cell(value):
         return f"<td style='padding:4px 2px;text-align:center;width:{_COL_WIDTH};box-sizing:border-box;'>{value}</td>"
@@ -63,7 +72,16 @@ def scorecard_html(round_holes: pd.DataFrame, highlight_start: int | None = None
             style += f"background-color:{bg};color:{text_color};font-weight:600;"
         if highlight_start is not None and highlight_start <= hole <= highlight_end:
             style += "box-shadow:inset 0 0 0 3px #eda100;"
-        return f"<td style='{style}'>{score_by_hole[hole]}</td>"
+        if hole in estimated_holes:
+            label = f"{score_by_hole[hole]}*"
+            title = (
+                " title='Not fully recorded -- estimated (e.g. net double bogey imputed "
+                "for a missing hole, or a conceded/picked-up hole given a representative score)'"
+            )
+        else:
+            label = str(score_by_hole[hole])
+            title = ""
+        return f"<td style='{style}'{title}>{label}</td>"
 
     def _label_cell(text):
         return (
@@ -138,6 +156,134 @@ def scorecard_html(round_holes: pd.DataFrame, highlight_start: int | None = None
     return "".join(blocks)
 
 
+def round_detail_html(round_id: int, round_holes: pd.DataFrame, global_rated_df: pd.DataFrame) -> str:
+    """Build the expanded detail shown under a clicked round (used by both
+    the Macro Trends rounds table and the All Time Records rounds tables):
+    a classic horizontal scorecard (gross scores, front 9 then back 9), a
+    callout of the longest streak achieved in that round for each category,
+    and where this round's score differential ranks among several
+    comparison groups.
+
+    Streaks qualify on net-double-bogey-capped scores (WHS Rule 3.1), same
+    convention as the rest of this app, but the scorecard itself shows real,
+    uncapped strokes. Rankings are always computed against the full
+    (unfiltered) history, regardless of any filters applied on the calling
+    page.
+    """
+    ordered = round_holes.sort_values("hole_number")
+    scorecard = scorecard_html(ordered)
+
+    capped_for_streaks = ordered.rename(columns={"score": "raw_score", "capped_score": "score"})
+    streak_lines = []
+    for label, max_to_par in STREAK_CATEGORIES:
+        runs = category_streaks(capped_for_streaks, max_to_par)
+        if not runs:
+            streak_lines.append(f"<div><b>{label}:</b> none</div>")
+            continue
+        best = max(runs, key=lambda r: r["length"])
+        streak_lines.append(
+            f"<div><b>{label}:</b> {best['length']} hole(s) "
+            f"(Holes {best['start_hole']}-{best['end_hole']})</div>"
+        )
+
+    rankings = compute_round_rankings(round_id, global_rated_df)
+    ranking_lines = [f"<div><b>{label}:</b> {value}</div>" for label, value in rankings]
+
+    sections = (
+        "<div style='margin-top:4px;font-size:0.85rem;display:flex;gap:24px;flex-wrap:wrap;'>"
+        "<div>" + "".join(streak_lines) + "</div>"
+    )
+    if ranking_lines:
+        sections += "<div>" + "".join(ranking_lines) + "</div>"
+    sections += "</div>"
+
+    return f"<div style='padding:8px 4px;'>{scorecard}{sections}</div>"
+
+
+def expandable_rounds_table_html(
+    columns: list[str],
+    rows: list[dict],
+    round_details: dict[int, str],
+    table_id: str,
+):
+    """Render a rounds table where clicking a row splices that round's
+    detail HTML directly into the gap between it and the next row --
+    clicking the same row again collapses it, and clicking a different row
+    closes whichever one was open first.
+
+    Each dict in `rows` needs a "_round_id" key (used to look up
+    `round_details` and passed to the click handler) plus one entry per
+    label in `columns` (an already-formatted display value -- inline HTML,
+    e.g. a colored dot span, is fine). An optional "_row_style" key adds
+    extra inline CSS to that <tr> (e.g. a divider border).
+
+    Uses st.iframe with height="content", so the iframe (and the page
+    content below it) grows and shrinks in real time as rows expand and
+    collapse -- Streamlit's own content-measuring script (auto-injected for
+    height="content") re-measures on every DOM mutation, which includes our
+    click handler splicing a detail row in and out.
+
+    st.markdown doesn't reliably execute <script> tags, so this uses
+    st.iframe, which runs in a real iframe (same technique as the other
+    shared HTML table components in this module).
+    """
+    header = "<tr>" + "".join(
+        f"<th style='text-align:left;padding:4px 8px;'>{col}</th>" for col in columns
+    ) + "</tr>"
+
+    row_html = []
+    for row in rows:
+        round_id = int(row["_round_id"])
+        row_style = row.get("_row_style", "")
+        cells = "".join(f"<td style='padding:4px 8px;'>{row[col]}</td>" for col in columns)
+        row_html.append(
+            f"<tr style='cursor:pointer;{row_style}' "
+            f"onclick=\"toggleDetail_{table_id}(this, {round_id})\">{cells}</tr>"
+        )
+
+    no_data_message = "No hole-by-hole data recorded for this round."
+    html = f"""
+    <style>
+        html, body {{
+            margin: 0;
+            background-color: #ffffff;
+            color: #31333f;
+            font-family: system-ui,-apple-system,'Segoe UI',sans-serif;
+        }}
+        @media (prefers-color-scheme: dark) {{
+            html, body {{ background-color: #0e1117; color: #fafafa; }}
+        }}
+    </style>
+    <table style='width:100%;border-collapse:collapse;font-size:0.9rem;'>
+        <thead>{header}</thead>
+        <tbody id="rounds-tbody-{table_id}">{''.join(row_html)}</tbody>
+    </table>
+    <script>
+    const roundDetails_{table_id} = {json.dumps(round_details)};
+    let openDetailRow_{table_id} = null;
+    function toggleDetail_{table_id}(rowEl, roundId) {{
+        const existing = rowEl.nextElementSibling;
+        if (existing && existing.classList.contains('detail-row-{table_id}')) {{
+            existing.remove();
+            openDetailRow_{table_id} = null;
+            return;
+        }}
+        if (openDetailRow_{table_id}) {{ openDetailRow_{table_id}.remove(); }}
+
+        const tr = document.createElement('tr');
+        tr.className = 'detail-row-{table_id}';
+        const td = document.createElement('td');
+        td.colSpan = {len(columns)};
+        td.innerHTML = roundDetails_{table_id}[roundId] || "<div style='padding:8px;'>{no_data_message}</div>";
+        tr.appendChild(td);
+        rowEl.parentNode.insertBefore(tr, rowEl.nextSibling);
+        openDetailRow_{table_id} = tr;
+    }}
+    </script>
+    """
+    st.iframe(html, height="content")
+
+
 def sort_key(value) -> str:
     """Extract a sortable value from a table cell: numbers sort numerically,
     'N (P%)' cells sort by the count N, everything else sorts as text.
@@ -166,9 +312,9 @@ def render_table_with_fixed_total(rows: list[dict], summary_rows: list[dict] | d
     be guaranteed to line up column-for-column since each auto-sizes
     independently. This renders one HTML table with real click-to-sort via
     embedded JS instead -- st.markdown doesn't reliably execute <script>
-    tags, so this uses st.components.v1.html, which runs in a real iframe.
-    The summary rows live in their own <tbody> that the sort script never
-    touches, so they always stay last regardless of how the data is sorted.
+    tags, so this uses st.iframe, which runs in a real iframe. The summary
+    rows live in their own <tbody> that the sort script never touches, so
+    they always stay last regardless of how the data is sorted.
     """
     if isinstance(summary_rows, dict):
         summary_rows = [summary_rows]
@@ -190,9 +336,6 @@ def render_table_with_fixed_total(rows: list[dict], summary_rows: list[dict] | d
     )
     data_rows = "".join(f"<tr>{_cells(row)}</tr>" for row in rows)
     summary_rows_html = "".join(f"<tr>{_cells(row, bold=True)}</tr>" for row in summary_rows)
-
-    row_height = 35
-    height = (len(rows) + len(summary_rows) + 1) * row_height + 20
 
     html = f"""
     <style>
@@ -245,4 +388,4 @@ def render_table_with_fixed_total(rows: list[dict], summary_rows: list[dict] | d
     }}
     </script>
     """
-    components.html(html, height=height)
+    st.iframe(html, height="content")

@@ -71,7 +71,7 @@ def render_scorecard_ai():
     full_holes = full_holes.rename(columns={"hole_number": "Hole", "score": "Score"})
 
     edited = st.data_editor(
-        full_holes, hide_index=True, num_rows="fixed", disabled=["Hole"], use_container_width=True,
+        full_holes, hide_index=True, num_rows="fixed", disabled=["Hole"], width="stretch",
     )
 
     if edited["Score"].isna().any():
