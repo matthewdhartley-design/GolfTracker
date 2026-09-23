@@ -1,8 +1,10 @@
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from scipy.stats import linregress
 
-from app.calculations.handicap_data import get_full_handicap_history
+from app.calculations.handicap_data import get_full_handicap_history, yearly_handicap_lows
 from app.calculations.scoring import CATEGORY_ORDER, round_score_distribution
 
 _CATEGORY_COLORS = {
@@ -12,6 +14,9 @@ _CATEGORY_COLORS = {
     "Double Bogey": "#eb6834",
     "Triple+ Bogey": "#d03b3b",
 }
+
+_CORRELATION_WINDOW = 20
+_EXTRAPOLATE_TO_HANDICAP = 10.0
 
 _WINDOW_PRESETS = [
     ("Last 20 Rounds", "r20"),
@@ -110,6 +115,10 @@ def render_scoring_trends():
     counts.index = pd.to_datetime(round_meta["date"])
 
     rolling = counts.rolling(window=window, min_periods=1).mean()
+    # Cumulative through each category and everything better than it (CATEGORY_ORDER
+    # runs best-to-worst, so a running cumsum at "Par" = Birdie or Better + Par) --
+    # shown in the tooltip alongside that category's own average.
+    cumulative = rolling[CATEGORY_ORDER].cumsum(axis=1)
 
     fig = go.Figure()
     for category in CATEGORY_ORDER:
@@ -120,19 +129,40 @@ def render_scoring_trends():
             name=category,
             stackgroup="one",
             line=dict(width=0.5, color=_CATEGORY_COLORS[category]),
+            customdata=cumulative[category],
+            hovertemplate=(
+                f"<b>{category}</b><br>"
+                "Avg Holes: %{y:.2f}<br>"
+                "Cumulative (this + better): %{customdata:.2f}"
+                "<extra></extra>"
+            ),
         ))
+
+    for low in yearly_handicap_lows(rated_df):
+        fig.add_vline(
+            x=pd.Timestamp(low["date"]),
+            line_width=1,
+            line_dash="dot",
+            line_color="#0ca30c",
+            opacity=0.7,
+            annotation_text=f"{low['year']} Low: {low['whs_handicap_index']:.1f}",
+            annotation_position="top",
+        )
+
     fig.update_layout(
         title=f"Rolling {window}-Round Average Score Distribution",
         xaxis_title="Date",
         yaxis_title="Avg Holes per Category",
         yaxis=dict(range=[0, 18]),
-        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5, traceorder="reversed"),
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5, traceorder="normal"),
         margin=dict(b=100),
     )
     st.plotly_chart(fig, width="stretch")
 
     current_handicap = rated_df.iloc[-1]["whs_handicap_index"] if not rated_df.empty else None
     _render_front_back_scatter(holes, round_meta, rated_df, current_handicap)
+
+    _render_handicap_correlation(counts, round_meta, rated_df)
 
 
 def _render_front_back_scatter(
@@ -235,3 +265,224 @@ def _render_front_back_scatter(
     if current_handicap is not None:
         with stats_col:
             st.dataframe(_stats_table(rated_df, plot_df, current_handicap), width="stretch")
+
+
+def _rolling_best_n_average(values: np.ndarray, differentials: np.ndarray, window: int, best_n: int) -> np.ndarray:
+    """For each row with `window` rows of history ending at it (inclusive),
+    average `values`' columns over just the `best_n` lowest-differential
+    rows within that window -- replicating WHS Rule 5.1's own selection at
+    every historical point (which rounds actually determined that window's
+    handicap), rather than a plain average of the full window. Rows without
+    enough history get NaN.
+    """
+    n_rows, n_cols = values.shape
+    result = np.full((n_rows, n_cols), np.nan)
+    for i in range(window - 1, n_rows):
+        window_diffs = differentials[i - window + 1: i + 1]
+        best_positions = np.argsort(window_diffs)[:best_n] + (i - window + 1)
+        result[i] = values[best_positions].mean(axis=0)
+    return result
+
+
+def _render_handicap_correlation(counts: pd.DataFrame, round_meta: pd.DataFrame, rated_df: pd.DataFrame):
+    """Scatter of WHS Handicap Index (x) against a chosen category's average
+    holes-per-round (y) -- one point per round with enough history -- to
+    explore how strongly each scoring category correlates with handicap.
+
+    Two averaging modes for the y-value, both over a fixed _CORRELATION_WINDOW
+    (not the adjustable slider used for the chart above, so every point is a
+    consistent, comparable sample size):
+    - Full window average (default): the plain average over all
+      _CORRELATION_WINDOW rounds -- a "meta trend" of overall game shape.
+    - "Only rounds that counted": averages just the 8 lowest-differential
+      rounds within each window (Rule 5.1's own selection, replayed at every
+      point in history) -- what actually needs to be shot to be near that
+      handicap, with non-counting rounds' noise excluded.
+
+    Two independent row filters narrow which points are plotted/regressed:
+    "Current counting rounds" (only the rounds counting toward *today's*
+    low Handicap Index) and "Only last 20 rounds" (your most recent form).
+
+    Only one category's individual round markers are plotted at a time (all
+    5 overlaid as points would be unreadable), selected via the Score Type
+    pills. Toggling "trendline only" hides every category's points and
+    instead draws all 5 trendlines together, so their slopes can be
+    compared directly. The stats table always lists all 5 categories'
+    regression confidence (r, R-squared, slope, p-value), regardless of
+    which one is currently selected or how it's being displayed.
+    """
+    st.subheader("Score Type vs Handicap Correlation")
+    st.caption(
+        f"Each point's y-value is that category's average holes per round over the "
+        f"{_CORRELATION_WINDOW} rounds up to and including that round."
+    )
+
+    category = st.pills(
+        "Score Type", CATEGORY_ORDER, default="Par", required=True, key="scoring_trends_corr_category"
+    )
+    toggle_col1, toggle_col2, toggle_col3, toggle_col4 = st.columns(4)
+    with toggle_col1:
+        trend_only = st.checkbox(
+            "Show trendline only (all score types)", key="scoring_trends_corr_trend_only"
+        )
+    with toggle_col2:
+        window_counting_only = st.checkbox(
+            "Only rounds that counted", key="scoring_trends_corr_window_counting_only",
+            help=(
+                "Average each window using only the 8 lowest-differential rounds within it -- "
+                "the rounds that actually determined that window's handicap -- instead of all "
+                f"{_CORRELATION_WINDOW}. Shows what you actually need to shoot to be near a "
+                "handicap, rather than the broader meta-trend of your overall game."
+            ),
+        )
+    with toggle_col3:
+        current_counting_only = st.checkbox(
+            "Current counting rounds", key="scoring_trends_corr_current_counting_only",
+            help="Restrict to rounds that currently count toward your low Handicap Index.",
+        )
+    with toggle_col4:
+        last_20_only = st.checkbox(
+            "Only last 20 rounds", key="scoring_trends_corr_last_20_only",
+            help="Restrict to your most recent 20 rounds.",
+        )
+
+    base = round_meta[["round_id"]].copy()
+    rated_indexed = rated_df.set_index("round_id")
+    base["handicap"] = base["round_id"].map(rated_indexed["whs_handicap_index"])
+    base["differential"] = base["round_id"].map(rated_indexed["score_differential"])
+    base["counts_toward_handicap"] = base["round_id"].map(rated_indexed["counts_toward_handicap"])
+
+    if window_counting_only:
+        y_values = _rolling_best_n_average(
+            counts[CATEGORY_ORDER].to_numpy(dtype=float), base["differential"].to_numpy(),
+            window=_CORRELATION_WINDOW, best_n=8,
+        )
+    else:
+        y_values = counts[CATEGORY_ORDER].rolling(
+            window=_CORRELATION_WINDOW, min_periods=_CORRELATION_WINDOW
+        ).mean().to_numpy()
+
+    for idx, cat in enumerate(CATEGORY_ORDER):
+        base[cat] = y_values[:, idx]
+    # The trendline/regression stats are always computed from the full
+    # (unfiltered-by-row-toggle) dataset, so they stay fixed as "Current
+    # counting rounds"/"Only last 20 rounds" are toggled -- those two only
+    # change which scatter points are drawn, not the fitted line itself.
+    full_merged = base.dropna(subset=["handicap", *CATEGORY_ORDER])
+
+    if len(full_merged) < 2:
+        st.info(f"Not enough rounds yet -- need at least {_CORRELATION_WINDOW} rated rounds for this chart.")
+        return
+
+    display_merged = full_merged
+    if current_counting_only:
+        display_merged = display_merged[display_merged["counts_toward_handicap"]]
+    if last_20_only:
+        display_merged = display_merged.tail(20)
+
+    x_full = full_merged["handicap"].to_numpy()
+    x_display = display_merged["handicap"].to_numpy()
+    x_min_observed = float(x_full.min())
+    x_max_observed = float(x_full.max())
+    x_extrap_start = min(_EXTRAPOLATE_TO_HANDICAP, x_min_observed)
+    has_extrapolation = x_extrap_start < x_min_observed
+
+    fig = go.Figure()
+    stats_rows = []
+    extrapolated_maxima = []
+    for cat in CATEGORY_ORDER:
+        y_full = full_merged[cat].to_numpy()
+        result = linregress(x_full, y_full)
+        stats_rows.append({
+            "Category": cat,
+            "Rounds": len(full_merged),
+            "Correlation (r)": round(result.rvalue, 3),
+            "R²": round(result.rvalue ** 2, 3),
+            "Slope": round(result.slope, 3),
+            "p-value": round(result.pvalue, 4),
+            "Significant (p<0.05)": "Yes" if result.pvalue < 0.05 else "No",
+        })
+
+        if not trend_only and cat == category:
+            fig.add_trace(go.Scatter(
+                x=x_display, y=display_merged[cat].to_numpy(), mode="markers",
+                name=cat,
+                marker=dict(size=7, color=_CATEGORY_COLORS[cat], opacity=0.6),
+                hovertemplate=f"{cat} (actual): %{{y:.2f}}<extra></extra>",
+            ))
+
+        if trend_only or cat == category:
+            # Finely sampled (not just the 2 endpoints) so "x unified" hover
+            # in trendline-only mode can pick up every line's value at
+            # whatever x position is being hovered, not just the endpoints.
+            x_line = np.linspace(x_min_observed, x_max_observed, 100)
+            y_line = result.intercept + result.slope * x_line
+            fig.add_trace(go.Scatter(
+                x=x_line, y=y_line, mode="lines",
+                name=f"{cat} Trend",
+                line=dict(width=2, dash="dash", color=_CATEGORY_COLORS[cat]),
+                hovertemplate=f"{cat} (trend): %{{y:.2f}}<extra></extra>",
+            ))
+
+            if has_extrapolation:
+                # Same fitted line, continued below the lowest handicap
+                # actually observed -- drawn thinner/dotted so it reads as
+                # projection rather than fitted-to-data.
+                x_extrap = np.linspace(x_extrap_start, x_min_observed, 30)
+                y_extrap = result.intercept + result.slope * x_extrap
+                extrapolated_maxima.append(float(y_extrap.max()))
+                fig.add_trace(go.Scatter(
+                    x=x_extrap, y=y_extrap, mode="lines",
+                    name=f"{cat} Trend (Extrapolated)",
+                    line=dict(width=1.5, dash="dot", color=_CATEGORY_COLORS[cat]),
+                    opacity=0.55,
+                    hovertemplate=f"{cat} (extrapolated): %{{y:.2f}}<extra></extra>",
+                    showlegend=False,
+                ))
+
+    if has_extrapolation:
+        fig.add_vline(
+            x=x_min_observed,
+            line_width=1,
+            line_dash="dot",
+            line_color="#898781",
+            opacity=0.7,
+            annotation_text=f"Extrapolation begins ({x_min_observed:.1f})",
+            annotation_position="top",
+        )
+
+    window_label = "Best 8 of 20" if window_counting_only else f"Full {_CORRELATION_WINDOW}"
+    if trend_only:
+        title = f"All Score Types: {window_label} Avg Trend vs Handicap Index"
+        yaxis_title = f"Avg Holes ({window_label})"
+    else:
+        title = f"{category}: {window_label} Avg vs Handicap Index"
+        yaxis_title = f"Avg {category} Holes ({window_label})"
+
+    # Fixed at [0, max across all 5 series] (not just the displayed one) so
+    # the axis doesn't jump around as the Score Type/toggles are changed --
+    # a moving y-axis was undercutting the visual comparison this chart is for.
+    # Also widened to fit the extrapolated projection(s), which can run
+    # higher than any actually-observed value.
+    y_max = max([float(full_merged[CATEGORY_ORDER].to_numpy().max())] + extrapolated_maxima)
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="WHS Handicap Index",
+        yaxis_title=yaxis_title,
+        # Rounds the shared "x unified" hover header to 1 decimal place --
+        # otherwise it shows the raw interpolated x position (e.g. 17.15687).
+        xaxis=dict(hoverformat=".1f"),
+        yaxis=dict(range=[0, y_max]),
+        margin=dict(b=40),
+        height=900,
+        # "x unified" always -- in trendline-only mode this surfaces every
+        # category's value at once for a given x; in single-category mode it
+        # ensures the trend's fitted value is always shown alongside the
+        # actual point, with the x-axis (handicap) position as the shared
+        # header, rather than only showing whichever trace is under the cursor.
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    st.dataframe(pd.DataFrame(stats_rows), hide_index=True, width="stretch")

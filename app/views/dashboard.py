@@ -2,7 +2,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from app.calculations.handicap_data import get_full_handicap_history
+from app.calculations.handicap_data import get_full_handicap_history, yearly_handicap_lows
 from app.calculations.whs import compute_handicap_trend
 from app.views.course_preview import render_course_preview
 from app.views.scoring_trends import render_scoring_trends
@@ -125,6 +125,29 @@ def _zoom_x_range(rated_df: pd.DataFrame, x_col: str, zoom: str | None):
     if x_col == "date":
         x_min, x_max = pd.Timestamp(x_min), pd.Timestamp(x_max)
     return x_min, x_max
+
+
+_Y_TREND_COLUMNS = [
+    "score_differential", "counting_low", "counting_high", "whs_handicap_index",
+    "high_counting_low", "high_counting_high", "high_handicap_index",
+]
+
+
+def _zoom_y_range(rated_df: pd.DataFrame, x_col: str, x_min, x_max) -> tuple[float, float] | None:
+    """Auto-crop the y-axis to whatever's actually visible in [x_min, x_max]
+    (across every series plotted on the Handicap Over Time chart), with a
+    small buffer so points don't sit flush against the plot edge. Returns
+    None (full autorange) if the window is empty.
+    """
+    x_series = pd.to_datetime(rated_df["date"]) if x_col == "date" else rated_df[x_col]
+    subset = rated_df[(x_series >= x_min) & (x_series <= x_max)]
+    if subset.empty:
+        return None
+
+    y_min = subset[_Y_TREND_COLUMNS].min().min()
+    y_max = subset[_Y_TREND_COLUMNS].max().max()
+    buffer = max((y_max - y_min) * 0.08, 0.5)
+    return y_min - buffer, y_max + buffer
 
 
 def _render_competition_eligibility(full_rounds_df: pd.DataFrame):
@@ -338,22 +361,44 @@ def _render_trends():
             annotation_position="top",
         )
 
+    for low in yearly_handicap_lows(rated_df):
+        year_low_x = low[x_col]
+        if x_col == "date":
+            year_low_x = pd.Timestamp(year_low_x)
+        fig.add_vline(
+            x=year_low_x,
+            line_width=1,
+            line_dash="dot",
+            line_color="#0ca30c",
+            opacity=0.7,
+            annotation_text=f"{low['year']} Low: {low['whs_handicap_index']:.1f}",
+            annotation_position="top",
+        )
+
     x_min, x_max = rated_df[x_col].min(), rated_df[x_col].max()
     if x_col == "date":
         x_min, x_max = pd.Timestamp(x_min), pd.Timestamp(x_max)
 
     zoom = st.session_state.get("macro_trends_zoom")
     zoom_range = _zoom_x_range(rated_df, x_col, zoom)
+
+    y_range = None
     if zoom_range is not None:
         x_min, x_max = zoom_range
+        y_range = _zoom_y_range(rated_df, x_col, x_min, x_max)
+
+    yaxis = dict(title="Handicap")
+    if y_range is not None:
+        yaxis["range"] = y_range
 
     fig.update_layout(
         title="Handicap Over Time",
         xaxis_title=x_axis_label,
-        yaxis_title="Handicap",
+        yaxis=yaxis,
         xaxis=dict(range=[x_min, x_max]),
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
         margin=dict(b=100),
+        height=900,
     )
 
     with chart_col:

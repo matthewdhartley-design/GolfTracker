@@ -3,9 +3,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from app.calculations.handicap_data import get_full_handicap_history
+from app.calculations.knockouts import build_knockout_grid, stage_rank
 from app.calculations.scoring import CATEGORY_ORDER, categorize_score
 from app.calculations.streaks import STREAK_CATEGORIES, category_streaks
 from app.views.table_components import expandable_rounds_table_html, round_detail_html
+from database.queries import get_knockout_competitions, get_knockout_matches
 
 
 def _best_worst_rows(comp_rated: pd.DataFrame, n: int, ascending: bool) -> list[dict]:
@@ -72,9 +74,9 @@ def _render_rounds_table(comp_rated: pd.DataFrame, comp_holes: pd.DataFrame, glo
     expandable_rounds_table_html(columns, rows, round_details, table_id="competition_dashboard_rounds")
 
 
-def render_competition_dashboard():
-    """Render the Competition Dashboard tab: performance specifically in
-    rounds tagged with a competition_name (see database/queries.py --
+def _render_stroke_play():
+    """Render the Stroke Play sub-tab: performance specifically in rounds
+    tagged with a competition_name (see database/queries.py --
     ALTER TABLE golf.golf_rounds ADD COLUMN competition_name), benchmarked
     against casual (untagged) rounds over the same full history.
     """
@@ -193,3 +195,121 @@ def render_competition_dashboard():
 
     st.markdown("**All Competition Rounds**")
     _render_rounds_table(comp_rated, comp_holes, rated_df)
+
+
+def _format_handicap(index_val, playing_val) -> str:
+    if pd.isna(index_val) or pd.isna(playing_val):
+        return ""
+    return f"{index_val:.1f} / {int(playing_val)}"
+
+
+def _match_result_label(row) -> str:
+    if row.is_bye:
+        return "Bye"
+    if row.won is None or pd.isna(row.won):
+        return "-"
+    return "Won" if row.won else "Lost"
+
+
+def _render_knockout_grid(filtered: pd.DataFrame, competitions_df: pd.DataFrame):
+    grid, row_labels = build_knockout_grid(filtered, competitions_df)
+    if grid.empty:
+        return
+
+    display_df = grid.reset_index(drop=True).fillna("")
+    display_df.insert(0, "Stage", [row_labels[d] for d in grid.index])
+    st.dataframe(display_df, hide_index=True, width="stretch")
+
+
+def _render_knockout_match_log(filtered: pd.DataFrame):
+    sort_helper = filtered.assign(_stage_rank=filtered["stage"].map(stage_rank))
+    sort_helper = sort_helper.sort_values(
+        ["year", "competition_name", "_stage_rank"], ascending=[False, True, True]
+    )
+
+    rows = []
+    for row in sort_helper.itertuples():
+        opponents = row.opponent1_name or ""
+        if pd.notna(row.opponent2_name) and row.opponent2_name:
+            opponents += f" / {row.opponent2_name}"
+
+        opponent_handicaps = [
+            h for h in [
+                _format_handicap(row.opponent1_handicap_index, row.opponent1_playing_handicap),
+                _format_handicap(row.opponent2_handicap_index, row.opponent2_playing_handicap),
+            ] if h
+        ]
+
+        rows.append({
+            "Competition": row.competition_name,
+            "Year": str(row.season_label) if pd.notna(row.season_label) else str(row.year),
+            "Stage": row.stage,
+            "Date": pd.Timestamp(row.match_date).strftime("%d-%b-%y") if pd.notna(row.match_date) else "TBC",
+            "My HI / PH": _format_handicap(row.my_handicap_index, row.my_playing_handicap),
+            "Partner": row.partner_name or "",
+            "Partner HI / PH": _format_handicap(row.partner_handicap_index, row.partner_playing_handicap),
+            "Opponent(s)": opponents,
+            "Opponent HI / PH": " / ".join(opponent_handicaps),
+            "Result": _match_result_label(row),
+            "Margin": row.margin or "",
+        })
+
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def _render_knockouts():
+    """Render the Knockouts sub-tab: matchplay knockout competitions
+    (Charlotte Cup, Barham Trophy, Parish Trophy, Parish Plate), shown as a
+    Final-anchored grid -- one column per (competition, year) edition, one
+    row per distance-from-final (see app/calculations/knockouts.py), so an
+    edition with fewer rounds (a smaller draw, or an early exit) simply
+    starts further down the table instead of misaligning with the Final row.
+    """
+    competitions_df = get_knockout_competitions()
+    matches_df = get_knockout_matches()
+
+    if matches_df.empty:
+        st.info("No knockout matches recorded yet.")
+        return
+
+    year_options = sorted(matches_df["year"].unique().tolist(), reverse=True)
+    competition_options = competitions_df["competition_name"].tolist()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        selected_years = st.multiselect(
+            "Year", year_options, default=year_options, key="knockout_year_filter"
+        )
+    with col2:
+        selected_competitions = st.multiselect(
+            "Competition", competition_options, default=competition_options, key="knockout_competition_filter"
+        )
+
+    filtered = matches_df[
+        matches_df["year"].isin(selected_years) & matches_df["competition_name"].isin(selected_competitions)
+    ]
+
+    if filtered.empty:
+        st.warning("No knockout matches match the selected filter(s).")
+        return
+
+    _render_knockout_grid(filtered, competitions_df)
+
+    st.markdown("**Match Details**")
+    _render_knockout_match_log(filtered)
+
+
+def render_competition_dashboard():
+    """Render the Competition Dashboard tab: Stroke Play (Monthly Medal,
+    Stableford, Club Champs, etc. -- see competition_name on golf_rounds)
+    and Knockouts (Charlotte Cup, Barham/Parish Trophy, etc. -- matchplay,
+    tracked separately in golf.knockout_matches since it doesn't produce a
+    stroke-play score differential).
+    """
+    tab_stroke_play, tab_knockouts = st.tabs(["Stroke Play", "Knockouts"])
+
+    with tab_stroke_play:
+        _render_stroke_play()
+
+    with tab_knockouts:
+        _render_knockouts()

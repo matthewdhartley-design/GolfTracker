@@ -149,7 +149,7 @@ def render_course_preview():
         on_handicap_score = tee_hcp + int(row["par"])
         metric_col2.metric(
             "On-Handicap Expected Score",
-            on_handicap_score,
+            f"{on_handicap_score} ({_to_par_str(on_handicap_score, int(row['par']))})",
             help=(
                 f"Course Handicap {tee_hcp} (Handicap Index {current_handicap:.1f}, "
                 f"Slope {row['slope_rating']:.0f}, Rating {row['course_rating']:.1f}) + Par {int(row['par'])}"
@@ -214,7 +214,7 @@ def render_course_preview():
             row_dict["Strokes Received"] = received
             row_dict["Expected Score"] = int(row.par) + received
         total_row["Strokes Received"] = tee_hcp
-        total_row["Expected Score"] = on_handicap_score
+        total_row["Expected Score"] = f"{on_handicap_score} ({_to_par_str(on_handicap_score, predicted_par)})"
 
     def _subtotal_row(label: str, subset_rows: list[dict]) -> dict:
         row = {"Hole": label}

@@ -33,3 +33,23 @@ def get_full_handicap_history() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     hole_df = hole_df[hole_df["round_id"].isin(rated_df["round_id"])]
     return compute_handicap_trend(rated_df, hole_df)
+
+
+def yearly_handicap_lows(rated_df: pd.DataFrame) -> list[dict]:
+    """One row per calendar year present in rated_df: the round_id, date, and
+    value of that year's lowest WHS Handicap Index -- used to overlay a
+    "best of the year" callout on charts spanning rated_df's date range.
+    """
+    if rated_df.empty:
+        return []
+    year_series = pd.to_datetime(rated_df["date"]).dt.year
+    best_idx_per_year = rated_df.groupby(year_series)["whs_handicap_index"].idxmin()
+    return [
+        {
+            "year": int(year),
+            "round_id": rated_df.loc[idx, "round_id"],
+            "date": rated_df.loc[idx, "date"],
+            "whs_handicap_index": rated_df.loc[idx, "whs_handicap_index"],
+        }
+        for year, idx in best_idx_per_year.items()
+    ]

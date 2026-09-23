@@ -276,3 +276,37 @@ def get_macro_rounds() -> pd.DataFrame:
     """
     with get_db_connection() as conn:
         return pd.read_sql(query, conn)
+
+
+def get_knockout_competitions() -> pd.DataFrame:
+    """Fetch all golf.knockout_competitions rows -- the fixed reference list
+    of named knockout events (Charlotte Cup, Barham Trophy, etc.), regardless
+    of whether any matches have been recorded for them yet.
+    """
+    query = """
+        SELECT competition_name, full_name, format, season, rounds_before_quarterfinal, notes
+        FROM golf.knockout_competitions
+        ORDER BY competition_name
+    """
+    with get_db_connection() as conn:
+        return pd.read_sql(query, conn)
+
+
+def get_knockout_matches() -> pd.DataFrame:
+    """Fetch all golf.knockout_matches rows -- one row per stage of a
+    knockout competition edition (competition_name + year), sorted so each
+    edition's stages are grouped together.
+    """
+    query = """
+        SELECT match_id, competition_name, year, season_label, stage, match_date,
+               course_name, tee_color, round_id, is_bye, partner_name,
+               my_handicap_index, my_playing_handicap,
+               partner_handicap_index, partner_playing_handicap,
+               opponent1_name, opponent1_handicap_index, opponent1_playing_handicap,
+               opponent2_name, opponent2_handicap_index, opponent2_playing_handicap,
+               won, margin, notes
+        FROM golf.knockout_matches
+        ORDER BY competition_name, year
+    """
+    with get_db_connection() as conn:
+        return pd.read_sql(query, conn)
